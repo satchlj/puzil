@@ -368,6 +368,25 @@ impl SettingsView {
             .on_click(move |_, _, cx| cx.open_url(&url))
     }
 
+    /// A filled button for an action here in Puzil (add `on_click`).
+    fn action_button(&self, id: &str, label: &str) -> Stateful<Div> {
+        let t = &self.theme;
+        div()
+            .id(SharedString::from(id.to_string()))
+            .flex()
+            .items_center()
+            .px_3()
+            .h(px(32.))
+            .rounded(px(4.))
+            .bg(t.accent)
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.9))
+            .text_size(px(13.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(white())
+            .child(label.to_string())
+    }
+
     /// Writes to the layer being edited.
     fn change(&mut self, f: impl FnOnce(&mut Prefs), cx: &mut Context<Self>) {
         let scope = self.scope.clone();
@@ -898,9 +917,28 @@ impl SettingsView {
             );
         }
         out.push(self.heading("About").into_any_element());
-        let update = match crate::updates::handle(cx).read(cx).available.clone() {
-            Some((v, url)) => self.link_button("update", &format!("Download {v}"), url).into_any_element(),
-            None => div().text_size(px(13.)).text_color(t.faint).child("Up to date").into_any_element(),
+        let update = {
+            use crate::updates::{self, Phase};
+            let u = updates::handle(cx).read(cx);
+            let installable = u.can_install();
+            match (u.available.clone(), u.phase.clone()) {
+                (None, _) => div().text_size(px(13.)).text_color(t.faint).child("Up to date").into_any_element(),
+                (Some(r), Phase::Idle) if installable => self
+                    .action_button("update", &format!("Update to {} and restart", r.version))
+                    .on_click(|_, _, cx| updates::install(cx))
+                    .into_any_element(),
+                (Some(r), Phase::Idle) => self.link_button("update", &format!("Download {}", r.version), r.page).into_any_element(),
+                (Some(_), Phase::Downloading(n)) => div().text_size(px(13.)).text_color(t.muted).child(format!("Downloading… {n}%")).into_any_element(),
+                (Some(_), Phase::Installing) => div().text_size(px(13.)).text_color(t.muted).child("Installing…").into_any_element(),
+                (Some(r), Phase::Failed(msg)) => div()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap_1()
+                    .child(self.link_button("update", &format!("Download {}", r.version), r.page))
+                    .child(div().max_w(px(320.)).text_size(px(12.)).text_color(t.danger).child(msg))
+                    .into_any_element(),
+            }
         };
         out.push(self.row("Puzil", Some(concat!("Version ", env!("CARGO_PKG_VERSION"))), update, None).into_any_element());
         out
