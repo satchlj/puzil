@@ -533,17 +533,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "auth-spike"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui-kit",
- "puzil-zulip",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4623,22 +4612,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "math-bakeoff"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "mitex",
- "roxmltree 0.20.0",
- "serde",
- "serde_json",
- "typst",
- "typst-assets",
- "typst-layout",
- "typst-svg",
-]
-
-[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6722,14 +6695,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "richtext-list"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui-kit",
 ]
 
 [[package]]
