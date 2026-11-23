@@ -1,0 +1,18 @@
+[package]
+name = "puzil-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "puzil"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+puzil-zulip = { path = "../puzil-zulip" }
+puzil-store = { path = "../puzil-store" }

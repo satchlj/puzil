@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+zuliprc
+.env
+reference/
+/dist

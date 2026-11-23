@@ -1,0 +1,34 @@
+[package]
+name = "puzil-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "puzil-app"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit.workspace = true
+anyhow.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+puzil-zulip = { path = "../puzil-zulip" }
+puzil-store = { path = "../puzil-store" }
+puzil-render = { path = "../puzil-render" }
+puzil-math = { path = "../puzil-math" }
+puzil-overlay = { path = "../puzil-overlay" }
+puzil-avatar = { path = "../puzil-avatar" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+blake3 = "1"
+smallvec = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSImage"] }

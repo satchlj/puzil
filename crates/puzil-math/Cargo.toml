@@ -1,0 +1,20 @@
+[package]
+name = "puzil-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+typst = "0.15"
+typst-assets = { version = "0.15", features = ["fonts"] }
+typst-svg = "0.15"
+typst-layout = "0.15"
+mitex = { git = "https://github.com/mitex-rs/mitex", rev = "23ab8dffda5c94f0b69350a060020102a097dc36" }
+roxmltree = "0.20"
+blake3 = "1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+puzil-render = { path = "../puzil-render" }
+serde_json = { workspace = true }
