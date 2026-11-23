@@ -11,7 +11,29 @@ A fast native [Zulip](https://zulip.com) client for macOS (Linux to follow), wri
 
 ## Install
 
-Download `Puzil-<version>.zip` from [Releases](../../releases), unzip, and move `Puzil.app` to Applications. Sign in with your organization's URL (password, SSO, or a `zuliprc` file).
+Download `Puzil-<version>.zip` from [Releases](../../releases), unzip, and move `Puzil.app` to Applications.
+
+### Opening it the first time
+
+Puzil isn't signed with an Apple Developer ID or notarized by Apple, so macOS refuses to open it at first ("Apple could not verify Puzil is free of malware"). Right-click → Open no longer gets past this on recent macOS. Instead, either:
+
+**In System Settings**
+1. Double-click Puzil and dismiss the warning with **Done**.
+2. Open **System Settings → Privacy & Security** and scroll down to Security.
+3. Next to "Puzil was blocked to protect your Mac", click **Open Anyway**, then confirm with your password or Touch ID.
+4. In the dialog that follows, click **Open Anyway** again.
+
+**Or in Terminal**, remove the download quarantine and open it normally:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Puzil.app
+```
+
+Each version you download is quarantined again, so after updating, repeat either one.
+
+Releases are signed with the same certificate every time, so after an update macOS doesn't ask again for access to Puzil's saved logins.
+
+Sign in with your organization's URL (password, SSO, or a `zuliprc` file).
 
 ## Build
 
@@ -22,7 +44,7 @@ cargo run --release -p puzil-app       # run from source
 tools/macos/bundle.sh                  # build dist/Puzil.app and a zip
 ```
 
-`PUZIL_SIGN_ID="Developer ID Application: …"` signs with hardened runtime; adding `PUZIL_NOTARY_PROFILE=<notarytool profile>` also notarizes.
+The bundle is signed with a `Puzil Self-Signed` code-signing certificate when your keychain has one, otherwise ad hoc. `PUZIL_SIGN_ID="Developer ID Application: …"` signs with hardened runtime; adding `PUZIL_NOTARY_PROFILE=<notarytool profile>` also notarizes.
 
 The workspace:
 

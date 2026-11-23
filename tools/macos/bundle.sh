@@ -1,6 +1,8 @@
 #!/bin/zsh
 # Builds dist/Puzil.app from a release build.
-#   tools/macos/bundle.sh            ad-hoc signed (runs here; Gatekeeper warns elsewhere)
+#   tools/macos/bundle.sh            signed with the "Puzil Self-Signed" certificate when the
+#                                    keychain has it (a stable identity, so Keychain access survives
+#                                    updates), else ad-hoc. Gatekeeper warns on first open either way.
 #   PUZIL_SIGN_ID="Developer ID Application: …" tools/macos/bundle.sh
 #                                    signed with hardened runtime, ready to notarize
 #   PUZIL_NOTARY_PROFILE=<keychain profile> also notarizes and staples (notarytool)
@@ -17,6 +19,8 @@ cp assets/icon/Puzil.icns $APP/Contents/Resources/
 sed -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" tools/macos/Info.plist.in > $APP/Contents/Info.plist
 if [[ -n "$PUZIL_SIGN_ID" ]]; then
   codesign --force --options runtime --timestamp --sign "$PUZIL_SIGN_ID" $APP
+elif security find-certificate -c "Puzil Self-Signed" >/dev/null 2>&1; then
+  codesign --force --options runtime --sign "Puzil Self-Signed" $APP
 else
   codesign --force --sign - $APP
 fi

@@ -133,7 +133,7 @@ impl Render for Welcome {
                     .flex_col()
                     .items_center()
                     .gap_3()
-                    .child(gpui_kit::img(ImageSource::Render(icons::app_icon())).size(px(72.)))
+                    .child(gpui_kit::img(ImageSource::Render(icons::app_icon(72.))).size(px(72.)))
                     .child(div().font_family(super::rich::DISPLAY_FONT).text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(t.fg_strong).child("Make Puzil yours"))
                     .child(div().text_center().text_color(t.muted).child("Pick a theme. You can change it any time in Settings (⌘,)."))
                     .child(div().pt_4().flex().flex_row().flex_wrap().justify_center().gap_3().children(cards))

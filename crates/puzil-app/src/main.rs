@@ -21,6 +21,7 @@ mod session;
 mod settings;
 mod theme;
 mod ui;
+mod updates;
 
 use std::borrow::Cow;
 
@@ -280,6 +281,7 @@ fn main() {
         dock::set_icon();
         settings::init(cx);
         servers::init(cx);
+        updates::init(cx);
         {
             let e = settings::effective(cx, None);
             theme::Theme::choose(e.palette, e.mode);
