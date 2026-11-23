@@ -6102,6 +6102,7 @@ dependencies = [
  "puzil-render",
  "puzil-store",
  "puzil-zulip",
+ "reqwest",
  "serde",
  "serde_json",
  "smallvec",

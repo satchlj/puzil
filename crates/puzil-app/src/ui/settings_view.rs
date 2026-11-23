@@ -823,7 +823,7 @@ impl SettingsView {
         out
     }
 
-    fn advanced(&self, _: &mut Context<Self>) -> Vec<AnyElement> {
+    fn advanced(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = self.theme.clone();
         let dir = crate::accounts::data_dir();
         let shown = dir.display().to_string();
@@ -898,7 +898,11 @@ impl SettingsView {
             );
         }
         out.push(self.heading("About").into_any_element());
-        out.push(self.row("Puzil", Some(concat!("Version ", env!("CARGO_PKG_VERSION"))), div(), None).into_any_element());
+        let update = match crate::updates::handle(cx).read(cx).available.clone() {
+            Some((v, url)) => self.link_button("update", &format!("Download {v}"), url).into_any_element(),
+            None => div().text_size(px(13.)).text_color(t.faint).child("Up to date").into_any_element(),
+        };
+        out.push(self.row("Puzil", Some(concat!("Version ", env!("CARGO_PKG_VERSION"))), update, None).into_any_element());
         out
     }
 }

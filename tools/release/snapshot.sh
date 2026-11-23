@@ -12,7 +12,9 @@ rm -rf $OUT/docs $OUT/spikes $OUT/tools/bundle_mac.sh $OUT/tools/release/publish
 sed -i '' 's|^members = \["crates/\*", "spikes/\*"\]|members = ["crates/*"]|' $OUT/Cargo.toml
 grep -q '^members = \["crates/\*"\]' $OUT/Cargo.toml || { echo "snapshot: couldn't rewrite workspace members" >&2; exit 1; }
 # Nothing personal or secret may slip through.
-if grep -rIlE -i "satya|satchlj|thesatchlj|benson\.earth|1215456|gho_[A-Za-z0-9]{20}" $OUT --exclude=Cargo.lock --exclude=snapshot.sh; then
+# The public repo's own address (satchlj/puzil) is allowed; any other match is not.
+PAT="satya|satchlj|thesatchlj|benson\.earth|1215456|gho_[A-Za-z0-9]{20}"
+if grep -rIniE "$PAT" $OUT --exclude=Cargo.lock --exclude=snapshot.sh | sed -E 's#satchlj/puzil##g' | grep -iE ":[0-9]+:.*($PAT)"; then
   echo "snapshot: personal or secret strings found (above); not publishing" >&2; exit 1
 fi
 echo $OUT

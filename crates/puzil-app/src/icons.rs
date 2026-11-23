@@ -6,7 +6,7 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 
 gpui_kit::assets::icon_assets!(
     Extra,
-    [ArrowBigDown, ArrowBigUp, AtSign, CirclePlus, CornerUpLeft, Hash, MessagesSquare, Pencil, Trash, Users, Bot, Lock, Link, Mail, FaceSlightlySmilingPlus, Compass, CheckCheck, BellOff, Bell, CircleCheck, LogOut, VolumeX, Search, Palette, Monitor, Sun, Moon, Building2, User, Settings2, PanelLeft, Minus, Plus,]
+    [ArrowBigDown, ArrowBigUp, AtSign, CirclePlus, CornerUpLeft, Hash, MessagesSquare, Pencil, Trash, Users, Bot, Lock, Link, Mail, FaceSlightlySmilingPlus, Compass, CheckCheck, BellOff, Bell, CircleCheck, LogOut, VolumeX, Search, Palette, Monitor, Sun, Moon, Building2, User, Settings2, PanelLeft, Minus, Plus, ArrowDown, ArrowRight,]
 );
 
 pub struct AppAssets;
@@ -49,17 +49,22 @@ pub fn channel(private: bool, size: f32, color: Hsla, bg: Hsla) -> Div {
     })
 }
 
-/// The app icon, decoded once (for the sign-in screen and About).
-pub fn app_icon() -> std::sync::Arc<RenderImage> {
-    static ICON: std::sync::OnceLock<std::sync::Arc<RenderImage>> = std::sync::OnceLock::new();
-    ICON.get_or_init(|| {
-        let mut rgba = image::load_from_memory(include_bytes!("../../../assets/icon/puzil-512.png")).map(|i| i.into_rgba8()).unwrap_or_default();
-        for px in rgba.chunks_exact_mut(4) {
-            px.swap(0, 2);
-        }
-        std::sync::Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(rgba)]))
-    })
-    .clone()
+/// The app icon drawn `points` wide, rendered at that size on a 2× display (cached per size):
+/// its band edges stay sharp, which a big image scaled down on the GPU would not.
+pub fn app_icon(points: f32) -> std::sync::Arc<RenderImage> {
+    static CACHE: std::sync::Mutex<Vec<(u32, std::sync::Arc<RenderImage>)>> = std::sync::Mutex::new(Vec::new());
+    let px = (points * 2.).round() as u32;
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((_, i)) = cache.iter().find(|(s, _)| *s == px) {
+        return i.clone();
+    }
+    let mut rgba = puzil_avatar::app_icon_style().render_icon(px);
+    for p in rgba.chunks_exact_mut(4) {
+        p.swap(0, 2);
+    }
+    let img = std::sync::Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(rgba)]));
+    cache.push((px, img.clone()));
+    img
 }
 
 /// An icon by its Lucide file name (`"corner-up-left"`), tinted with the text colour.

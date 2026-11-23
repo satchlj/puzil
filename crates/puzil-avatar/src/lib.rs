@@ -77,6 +77,11 @@ pub enum Motif {
     Vortex,
 }
 
+/// Puzil's own icon: the aubergine/ember wave in eight crisp bands.
+pub fn app_icon_style() -> Style {
+    Style::for_seed(4, 2).with_motif(Motif::Wave).with_palette(1).with_bands(8)
+}
+
 /// The motifs users get (eclipse read as a target).
 pub const MOTIFS: [Motif; 5] = [Motif::Swirl, Motif::Ripple, Motif::Marble, Motif::Wave, Motif::Vortex];
 
@@ -92,6 +97,8 @@ pub struct Style {
     phase: f32,
     spin: f32,
     noise_seed: u32,
+    /// Hard-edged bands instead of a smooth gradient (the crisp app icon); 0 is smooth.
+    bands: u8,
 }
 
 struct Rng(u64);
@@ -132,6 +139,7 @@ impl Style {
             phase: r.range(0., std::f32::consts::TAU),
             spin: if r.f() < 0.5 { -1. } else { 1. },
             noise_seed: r.next() as u32,
+            bands: 0,
         }
     }
 
@@ -143,6 +151,12 @@ impl Style {
     /// This style with palette `i` (see [`Style::palette_count`]).
     pub fn with_palette(mut self, i: usize) -> Self {
         self.stops = palette(i);
+        self
+    }
+
+    /// The field cut into `n` flat bands with sharp (antialiased) edges.
+    pub fn with_bands(mut self, n: u8) -> Self {
+        self.bands = n;
         self
     }
 
@@ -214,7 +228,12 @@ impl Style {
     /// Palette position to colour. The position wraps smoothly dark → mid → accent → mid →
     /// dark, so extra bands never show a seam.
     fn color(&self, t: f32) -> Lab {
-        let u = (t * 0.5 + 0.5).rem_euclid(1.0) * 4.;
+        let mut w = (t * 0.5 + 0.5).rem_euclid(1.0);
+        if self.bands > 0 {
+            let n = self.bands as f32;
+            w = (w * n).round() / n;
+        }
+        let u = w * 4.;
         let seg = u.floor() as i32;
         let f = smooth(u - seg as f32);
         let [a, b, c] = self.stops;
