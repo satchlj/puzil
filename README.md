@@ -37,7 +37,7 @@ Sign in with your organization's URL (password, SSO, or a `zuliprc` file).
 
 ### Linux
 
-Download the AppImage for your machine from [Releases](../../releases): `Puzil-<version>-x86_64.AppImage` for most PCs, `-aarch64` for ARM (Asahi Linux, Raspberry Pi, ARM laptops). Make it executable and run it:
+Download the AppImage for your machine from [Releases](../../releases): `Puzil-<version>-x86_64.AppImage` for most PCs, `-aarch64` for ARM machines. Make it executable and run it:
 
 ```bash
 chmod +x Puzil-*.AppImage
