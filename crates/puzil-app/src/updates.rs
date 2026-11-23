@@ -47,6 +47,12 @@ pub enum Phase {
 pub struct Updates {
     pub available: Option<Release>,
     pub phase: Phase,
+    /// The prompt was put off with "Later" (until the next launch, a newer release, or a
+    /// check from the menu).
+    pub dismissed: bool,
+    /// A check from the menu is running, or just found nothing ("You're up to date").
+    pub checking: bool,
+    pub up_to_date_notice: bool,
 }
 
 pub struct UpdatesHandle(pub Entity<Updates>);
@@ -74,10 +80,95 @@ impl Updates {
     pub fn can_install(&self) -> bool {
         self.available.as_ref().is_some_and(|r| r.zip.is_some()) && bundle().is_some()
     }
+
+    /// Whether the update prompt shows over the window.
+    pub fn prompting(&self) -> bool {
+        (self.available.is_some() && (!self.dismissed || self.phase != Phase::Idle)) || self.checking || self.up_to_date_notice
+    }
+}
+
+/// Puts the prompt off until something new happens.
+pub fn dismiss(cx: &mut App) {
+    handle(cx).update(cx, |u, cx| {
+        u.dismissed = true;
+        u.up_to_date_notice = false;
+        if matches!(u.phase, Phase::Failed(_)) {
+            u.phase = Phase::Idle;
+        }
+        cx.notify();
+    });
+}
+
+/// "Check for Updates…": checks now and always answers in the prompt.
+pub fn check_now(cx: &mut App) {
+    let e = handle(cx);
+    e.update(cx, |u, cx| {
+        u.dismissed = false;
+        u.checking = true;
+        u.up_to_date_notice = false;
+        cx.notify();
+    });
+    cx.spawn(async move |cx| {
+        let found = check(&e, cx).await;
+        let _ = e.update(cx, |u, cx| {
+            u.checking = false;
+            u.up_to_date_notice = !found && u.available.is_none();
+            cx.notify();
+        });
+        cx.background_executor().timer(Duration::from_secs(4)).await;
+        let _ = e.update(cx, |u, cx| {
+            u.up_to_date_notice = false;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Asks GitHub for the latest release; true when it's newer than this copy.
+async fn check(e: &Entity<Updates>, cx: &mut AsyncApp) -> bool {
+    // PUZIL_UPDATE_FEED stands in a local release description, for testing updates.
+    let feed = std::env::var("PUZIL_UPDATE_FEED").unwrap_or_else(|_| LATEST.to_string());
+    match on_tokio_json(feed).await {
+        Ok(v) => {
+            let tag = v["tag_name"].as_str().unwrap_or("").to_string();
+            if tag.is_empty() || !newer(&tag, env!("CARGO_PKG_VERSION")) {
+                // Nothing newer (a release withdrawn, say): forget an earlier offer.
+                let _ = e.update(cx, |u, cx| {
+                    if u.phase == Phase::Idle || matches!(u.phase, Phase::Failed(_)) {
+                        u.available = None;
+                        u.phase = Phase::Idle;
+                        cx.notify();
+                    }
+                });
+                return false;
+            }
+            let zip = v["assets"]
+                .as_array()
+                .and_then(|a| a.iter().find_map(|x| x["browser_download_url"].as_str().filter(|u| u.ends_with(".zip")).map(String::from)));
+            let release = Release {
+                version: tag.trim_start_matches('v').to_string(),
+                page: v["html_url"].as_str().unwrap_or("https://github.com/satchlj/puzil/releases").to_string(),
+                zip,
+            };
+            let _ = e.update(cx, |u, cx| {
+                // A newer release than the one put off asks again.
+                if u.available.as_ref().is_none_or(|a| a.version != release.version) {
+                    u.dismissed = false;
+                }
+                u.available = Some(release);
+                cx.notify();
+            });
+            true
+        }
+        Err(err) => {
+            tracing::debug!("update check: {err}");
+            false
+        }
+    }
 }
 
 pub fn init(cx: &mut App) {
-    let e = cx.new(|_| Updates { available: None, phase: Phase::Idle });
+    let e = cx.new(|_| Updates { available: None, phase: Phase::Idle, dismissed: false, checking: false, up_to_date_notice: false });
     cx.set_global(UpdatesHandle(e.clone()));
     // What the last update left behind.
     if let Some(dir) = bundle().and_then(|b| b.parent().map(|p| p.join(STAGING))) {
@@ -88,29 +179,7 @@ pub fn init(cx: &mut App) {
     }
     cx.spawn(async move |cx| {
         loop {
-            // PUZIL_UPDATE_FEED stands in a local release description, for testing updates.
-            let feed = std::env::var("PUZIL_UPDATE_FEED").unwrap_or_else(|_| LATEST.to_string());
-            match on_tokio_json(feed).await {
-                Ok(v) => {
-                    let tag = v["tag_name"].as_str().unwrap_or("").to_string();
-                    if !tag.is_empty() && newer(&tag, env!("CARGO_PKG_VERSION")) {
-                        let zip = v["assets"].as_array().and_then(|a| {
-                            a.iter().find_map(|x| x["browser_download_url"].as_str().filter(|u| u.ends_with(".zip")).map(String::from))
-                        });
-                        let release = Release {
-                            version: tag.trim_start_matches('v').to_string(),
-                            page: v["html_url"].as_str().unwrap_or("https://github.com/satchlj/puzil/releases").to_string(),
-                            zip,
-                        };
-                        let _ = e.update(cx, |u, cx| {
-                            u.available = Some(release);
-                            cx.notify();
-                        });
-                        let _ = cx.update(|cx| cx.refresh_windows());
-                    }
-                }
-                Err(err) => tracing::debug!("update check: {err}"),
-            }
+            check(&e, cx).await;
             cx.background_executor().timer(Duration::from_secs(6 * 3600)).await;
         }
     })

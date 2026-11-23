@@ -29,7 +29,7 @@ Puzil isn't signed with an Apple Developer ID or notarized by Apple, so macOS re
 xattr -dr com.apple.quarantine /Applications/Puzil.app
 ```
 
-You only do this once. After that Puzil updates itself: when a new version is out, quick settings (click your name at the bottom of the sidebar) and Settings › Advanced offer **Update to Puzil X**, which downloads it, checks it carries the same signature as the copy you have, swaps it in and restarts.
+You only do this once. After that Puzil updates itself: when a new version is out, a prompt appears in the corner of the window. **Update and restart** downloads it, checks it carries the same signature as the copy you have, swaps it in and restarts, all in one click. **Puzil › Check for Updates…** checks on demand.
 
 Releases are signed with the same certificate every time, so after an update macOS doesn't ask again for access to Puzil's saved logins.
 
