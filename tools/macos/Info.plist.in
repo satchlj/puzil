@@ -4,7 +4,7 @@
 <dict>
   <key>CFBundleName</key><string>Puzil</string>
   <key>CFBundleDisplayName</key><string>Puzil</string>
-  <key>CFBundleIdentifier</key><string>earth.benson.puzil</string>
+  <key>CFBundleIdentifier</key><string>com.satchlj.puzil</string>
   <key>CFBundleExecutable</key><string>puzil</string>
   <key>CFBundleIconFile</key><string>Puzil</string>
   <key>CFBundlePackageType</key><string>APPL</string>

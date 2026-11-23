@@ -1,6 +1,7 @@
 //! New versions: GitHub's latest release of the public repo, checked at launch and every six
-//! hours. A newer one shows in the account panel and Settings, and installs itself:
+//! hours. A newer one prompts over the window and installs itself in one click.
 //!
+//! On macOS:
 //! 1. the release zip downloads (an app's own downloads carry no quarantine, so the new copy
 //!    opens without Gatekeeper's prompt);
 //! 2. it unpacks into a staging folder beside the running app, on the same volume;
@@ -8,8 +9,12 @@
 //!    names the signing certificate: a zip signed by anyone else is refused;
 //! 4. the two apps swap places and Puzil relaunches. The old copy is deleted next launch.
 //!
-//! An unbundled or ad-hoc-signed Puzil can't verify an update this way, so it only links to
-//! the release page.
+//! On Linux, as an AppImage: the AppImage for this architecture downloads with its `.sig`,
+//! an ed25519 signature that must verify against [`RELEASE_KEY`]; the new file replaces the
+//! old one in place and Puzil relaunches. A build from source isn't updated.
+//!
+//! An unbundled or ad-hoc-signed Puzil can't verify an update, so it only links to the
+//! release page.
 
 use std::{
     path::{Path, PathBuf},
@@ -26,13 +31,65 @@ use gpui_kit::*;
 const LATEST: &str = "https://api.github.com/repos/satchlj/puzil/releases/latest";
 const STAGING: &str = ".puzil-update";
 
+/// The public half of the key the release workflow signs AppImages with (the private half is
+/// the repo's `PUZIL_UPDATE_KEY` secret).
+const RELEASE_KEY: [u8; 32] = hex32("ebd05f0bb7964c1ec985e1a126a2b8daad4723a78db84ca6ede1e3fd8c94f95d");
+
+const fn hex32(s: &str) -> [u8; 32] {
+    const fn nib(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("not hex"),
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = nib(b[2 * i]) << 4 | nib(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+
+/// `bytes` carries a valid release signature.
+fn signed_by_release_key(bytes: &[u8], sig: &[u8]) -> bool {
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&RELEASE_KEY) else { return false };
+    let Ok(sig) = ed25519_dalek::Signature::from_slice(sig) else { return false };
+    key.verify_strict(bytes, &sig).is_ok()
+}
+
 #[derive(Clone, Debug)]
 pub struct Release {
     pub version: String,
     /// The release page, for reading or downloading by hand.
     pub page: String,
-    /// The app zip attached to the release.
+    /// The macOS app zip attached to the release.
     pub zip: Option<String>,
+    /// This architecture's AppImage and its signature.
+    pub appimage: Option<(String, String)>,
+}
+
+/// What this copy of Puzil is, for updating it.
+enum Installed {
+    /// A macOS `.app`.
+    Bundle(PathBuf),
+    /// A Linux AppImage file (its own path, not the mount it runs from).
+    AppImage(PathBuf),
+}
+
+fn installed() -> Option<Installed> {
+    if cfg!(target_os = "macos") {
+        bundle().map(Installed::Bundle)
+    } else {
+        std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|p| p.is_file()).map(Installed::AppImage)
+    }
+}
+
+/// Whether this copy checks for updates at all (a build from source on Linux doesn't).
+pub fn supported() -> bool {
+    cfg!(target_os = "macos") || std::env::var_os("APPIMAGE").is_some()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,7 +135,11 @@ fn bundle() -> Option<PathBuf> {
 impl Updates {
     /// Whether "Update and restart" can work here (else the release page is offered).
     pub fn can_install(&self) -> bool {
-        self.available.as_ref().is_some_and(|r| r.zip.is_some()) && bundle().is_some()
+        match (self.available.as_ref(), installed()) {
+            (Some(r), Some(Installed::Bundle(_))) => r.zip.is_some(),
+            (Some(r), Some(Installed::AppImage(_))) => r.appimage.is_some(),
+            _ => false,
+        }
     }
 
     /// Whether the update prompt shows over the window.
@@ -101,6 +162,9 @@ pub fn dismiss(cx: &mut App) {
 
 /// "Check for Updates…": checks now and always answers in the prompt.
 pub fn check_now(cx: &mut App) {
+    if !supported() {
+        return;
+    }
     let e = handle(cx);
     e.update(cx, |u, cx| {
         u.dismissed = false;
@@ -142,13 +206,21 @@ async fn check(e: &Entity<Updates>, cx: &mut AsyncApp) -> bool {
                 });
                 return false;
             }
-            let zip = v["assets"]
+            let urls: Vec<String> = v["assets"]
                 .as_array()
-                .and_then(|a| a.iter().find_map(|x| x["browser_download_url"].as_str().filter(|u| u.ends_with(".zip")).map(String::from)));
+                .map(|a| a.iter().filter_map(|x| x["browser_download_url"].as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let zip = urls.iter().find(|u| u.ends_with(".zip")).cloned();
+            let suffix = format!("-{}.AppImage", std::env::consts::ARCH);
+            let appimage = urls.iter().find(|u| u.ends_with(&suffix)).and_then(|u| {
+                let sig = format!("{u}.sig");
+                urls.contains(&sig).then(|| (u.clone(), sig))
+            });
             let release = Release {
                 version: tag.trim_start_matches('v').to_string(),
                 page: v["html_url"].as_str().unwrap_or("https://github.com/satchlj/puzil/releases").to_string(),
                 zip,
+                appimage,
             };
             let _ = e.update(cx, |u, cx| {
                 // A newer release than the one put off asks again.
@@ -171,10 +243,18 @@ pub fn init(cx: &mut App) {
     let e = cx.new(|_| Updates { available: None, phase: Phase::Idle, dismissed: false, checking: false, up_to_date_notice: false });
     cx.set_global(UpdatesHandle(e.clone()));
     // What the last update left behind.
-    if let Some(dir) = bundle().and_then(|b| b.parent().map(|p| p.join(STAGING))) {
-        let _ = std::fs::remove_dir_all(dir);
+    match installed() {
+        Some(Installed::Bundle(b)) => {
+            if let Some(p) = b.parent() {
+                let _ = std::fs::remove_dir_all(p.join(STAGING));
+            }
+        }
+        Some(Installed::AppImage(a)) => {
+            let _ = std::fs::remove_file(appimage_temp(&a));
+        }
+        None => {}
     }
-    if std::env::var_os("PUZIL_NO_UPDATE_CHECK").is_some() {
+    if !supported() || std::env::var_os("PUZIL_NO_UPDATE_CHECK").is_some() {
         return;
     }
     cx.spawn(async move |cx| {
@@ -216,8 +296,17 @@ pub fn install(cx: &mut App) {
     if matches!(u.phase, Phase::Downloading(_) | Phase::Installing) {
         return;
     }
-    let (Some(release), Some(app)) = (u.available.clone(), bundle()) else { return };
-    let Some(zip_url) = release.zip.clone() else { return };
+    let (Some(release), Some(target)) = (u.available.clone(), installed()) else { return };
+    let (url, sig_url) = match &target {
+        Installed::Bundle(_) => match release.zip.clone() {
+            Some(z) => (z, None),
+            None => return,
+        },
+        Installed::AppImage(_) => match release.appimage.clone() {
+            Some((a, s)) => (a, Some(s)),
+            None => return,
+        },
+    };
     let progress = Arc::new(AtomicU8::new(0));
     e.update(cx, |u, cx| {
         u.phase = Phase::Downloading(0);
@@ -240,19 +329,32 @@ pub fn install(cx: &mut App) {
             }
         });
         let p = progress.clone();
-        let bytes = crate::runtime::on_tokio(async move { download(&zip_url, &p).await }).await;
-        let result = match bytes {
+        let fetched = crate::runtime::on_tokio(async move {
+            let sig = match sig_url {
+                Some(s) => Some(download(&s, &AtomicU8::new(0)).await?),
+                None => None,
+            };
+            Ok::<_, reqwest::Error>((download(&url, &p).await?, sig))
+        })
+        .await;
+        let result = match fetched {
             Err(err) => Err(format!("Download failed: {err}")),
-            Ok(bytes) => {
+            Ok((bytes, sig)) => {
                 set_phase(&e, Phase::Installing, cx);
-                let app2 = app.clone();
+                let path = match &target {
+                    Installed::Bundle(p) | Installed::AppImage(p) => p.clone(),
+                };
+                let appimage = matches!(target, Installed::AppImage(_));
                 cx.background_executor()
                     .spawn(async move {
-                        let r = stage_and_swap(&app2, &bytes);
+                        if appimage {
+                            return replace_appimage(&path, &bytes, sig.as_deref().unwrap_or_default());
+                        }
+                        let r = stage_and_swap(&path, &bytes);
                         // A refused or broken download goes now, not next launch; but only
                         // while the app is in place (a half-done swap leaves it in staging).
-                        if r.is_err() && app2.exists()
-                            && let Some(dir) = app2.parent()
+                        if r.is_err() && path.exists()
+                            && let Some(dir) = path.parent()
                         {
                             let _ = std::fs::remove_dir_all(dir.join(STAGING));
                         }
@@ -265,7 +367,7 @@ pub fn install(cx: &mut App) {
         match result {
             Ok(()) => {
                 tracing::info!("updated to {}; relaunching", release.version);
-                relaunch(&app);
+                relaunch(&target);
                 let _ = cx.update(|cx| cx.quit());
             }
             Err(msg) => {
@@ -294,6 +396,31 @@ async fn download(url: &str, progress: &AtomicU8) -> Result<Vec<u8>, reqwest::Er
         }
     }
     Ok(out)
+}
+
+/// Where a downloaded AppImage waits before replacing `current` (same folder, so the swap
+/// is a rename).
+fn appimage_temp(current: &Path) -> PathBuf {
+    current.with_file_name(".puzil-update.AppImage")
+}
+
+/// Checks the signature, then puts the new AppImage where the running one is. The running
+/// copy keeps its (now unlinked) file until it exits.
+fn replace_appimage(current: &Path, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
+    if !signed_by_release_key(bytes, sig) {
+        return Err("the update isn't signed with Puzil's release key; not installing it".into());
+    }
+    let tmp = appimage_temp(current);
+    std::fs::write(&tmp, bytes).map_err(|e| format!("Puzil can't write next to {}: {e}", current.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    }
+    std::fs::rename(&tmp, current).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("putting the new version in place: {e}")
+    })
 }
 
 /// Unpacks the zip beside `app`, checks its signature, and swaps it in.
@@ -350,22 +477,35 @@ fn run(cmd: &mut Command, what: &str) -> Result<(), String> {
     }
 }
 
-/// Opens `app` again once this process has exited, passing on Puzil's environment
+/// Starts the updated Puzil once this process has exited, passing on Puzil's environment
 /// overrides (a development data folder, say).
-fn relaunch(app: &Path) {
-    let mut args: Vec<String> = vec![std::process::id().to_string(), app.display().to_string()];
-    for (k, v) in std::env::vars() {
-        if k.starts_with("PUZIL_") {
-            args.push("--env".into());
-            args.push(format!("{k}={v}"));
+fn relaunch(target: &Installed) {
+    let wait = r#"pid=$1; shift; while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done; exec "$@""#;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(wait).arg("sh").arg(std::process::id().to_string());
+    match target {
+        Installed::Bundle(app) => {
+            cmd.arg("/usr/bin/open").arg(app);
+            for (k, v) in std::env::vars() {
+                if k.starts_with("PUZIL_") {
+                    cmd.arg("--env").arg(format!("{k}={v}"));
+                }
+            }
+        }
+        Installed::AppImage(file) => {
+            // The new AppImage sets these for itself; the old mount's would point at nothing.
+            cmd.arg(file);
+            for k in ["APPDIR", "APPIMAGE", "ARGV0", "OWD"] {
+                cmd.env_remove(k);
+            }
         }
     }
-    let _ = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(r#"pid=$1; shift; while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open "$@""#)
-        .arg("sh")
-        .args(args)
-        .spawn();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let _ = cmd.spawn();
 }
 
 #[cfg(test)]
@@ -376,5 +516,23 @@ mod tests {
         assert!(super::newer("0.10.0", "0.9.3"));
         assert!(!super::newer("v0.1.0", "0.1.0"));
         assert!(!super::newer("0.1.0", "0.2.0"));
+    }
+
+    /// Signed by the release workflow's command (`openssl pkeyutl -sign -rawin`) with the
+    /// real release key.
+    #[test]
+    fn checks_release_signatures() {
+        let msg = b"puzil update test\n";
+        let sig = hex(
+            "35b60a7fa6776e26310acb0a4078ef52c86b0a8a8e4141195a0c46d3fc77184542b1aed1718457dadc0ffe9a0d9eb9691d120dfa9a4dac44af39483c29e25b08",
+        );
+        assert!(super::signed_by_release_key(msg, &sig));
+        assert!(!super::signed_by_release_key(b"puzil update test, tampered\n", &sig));
+        assert!(!super::signed_by_release_key(msg, &sig[..63]));
+        assert!(!super::signed_by_release_key(msg, &[]));
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 }

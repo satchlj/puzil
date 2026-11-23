@@ -135,7 +135,7 @@ impl Render for Welcome {
                     .gap_3()
                     .child(gpui_kit::img(ImageSource::Render(icons::app_icon(72.))).size(px(72.)))
                     .child(div().font_family(super::rich::DISPLAY_FONT).text_size(px(26.)).font_weight(FontWeight::BOLD).text_color(t.fg_strong).child("Make Puzil yours"))
-                    .child(div().text_center().text_color(t.muted).child("Pick a theme. You can change it any time in Settings (⌘,)."))
+                    .child(div().text_center().text_color(t.muted).child(concat!("Pick a theme. You can change it any time in Settings (", key!(","), ").")))
                     .child(div().pt_4().flex().flex_row().flex_wrap().justify_center().gap_3().children(cards))
                     .child(div().pt_4().child(modes))
                     .child(
@@ -163,7 +163,7 @@ impl Render for Welcome {
                             .pt_2()
                             .text_size(px(13.))
                             .text_color(t.faint)
-                            .child("⌘K jumps anywhere · ⌘F searches · right-click a message for more"),
+                            .child(concat!(key!("K"), " jumps anywhere · ", key!("F"), " searches · right-click a message for more")),
                     ),
             )
     }
