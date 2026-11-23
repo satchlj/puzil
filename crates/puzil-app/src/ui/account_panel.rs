@@ -107,23 +107,50 @@ impl Sidebar {
             .child(label("Mode"))
             .child(modes)
             .child(div().h(px(1.)).my_2().bg(t.divider))
-            .children(crate::updates::handle(cx).read(cx).available.clone().map(|(v, url)| {
-                div()
-                    .id("qp-update")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(34.))
-                    .px_1()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .bg(t.accent.opacity(0.12))
-                    .hover(|s| s.bg(t.accent.opacity(0.2)))
-                    .child(icons::icon("arrow-down", 16., t.accent))
-                    .child(div().flex_1().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(t.fg).child(format!("Puzil {v} is available")))
-                    .on_click(move |_, _, cx| cx.open_url(&url))
-            }))
+            .children({
+                use crate::updates::{self, Phase};
+                let u = updates::handle(cx).read(cx);
+                let installable = u.can_install();
+                let phase = u.phase.clone();
+                u.available.clone().map(|r| {
+                    let (text, hint) = match &phase {
+                        Phase::Idle if installable => (format!("Update to Puzil {}", r.version), Some("Restarts Puzil")),
+                        Phase::Idle => (format!("Puzil {} is available", r.version), None),
+                        Phase::Downloading(n) => (format!("Downloading… {n}%"), None),
+                        Phase::Installing => ("Installing…".to_string(), None),
+                        Phase::Failed(_) => ("Update failed".to_string(), Some("Open the release page")),
+                    };
+                    let page = r.page.clone();
+                    div()
+                        .id("qp-update")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .min_h(px(34.))
+                        .py_1p5()
+                        .px_1()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .bg(t.accent.opacity(0.12))
+                        .hover(|s| s.bg(t.accent.opacity(0.2)))
+                        .child(icons::icon("arrow-down", 16., t.accent))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).text_color(t.fg).child(text))
+                                .children(hint.map(|h| div().text_size(px(12.)).text_color(t.muted).child(h))),
+                        )
+                        .on_click(move |_, _, cx| match phase {
+                            Phase::Idle if installable => updates::install(cx),
+                            Phase::Idle | Phase::Failed(_) => cx.open_url(&page),
+                            _ => {}
+                        })
+                })
+            })
             .child(
                 div()
                     .id("qp-add-server")
