@@ -58,6 +58,7 @@ impl Workspace {
         let theme = Rc::new(Theme::for_appearance(window.appearance()));
         let sidebar = cx.new(|cx| Sidebar::new(session.clone(), theme.clone(), cx));
         let subs = vec![
+            cx.observe(&crate::updates::handle(cx), |_, _, cx| cx.notify()),
             cx.subscribe_in(&sidebar, window, |this, _, e: &SidebarEvent, window, cx| match e {
                 SidebarEvent::Open(t) => this.open(t.clone(), window, cx),
                 SidebarEvent::Settings => this.show_settings(super::settings_view::Section::Appearance, window, cx),
@@ -348,6 +349,116 @@ fn is_image_path(h: &str) -> bool {
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
 }
 
+impl Workspace {
+    /// The update prompt: appears on its own over the top right of the window when a new
+    /// version is out. One click downloads, verifies, installs and restarts.
+    fn render_update_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::updates::{self, Phase};
+        let u = crate::updates::handle(cx).read(cx);
+        if !self.active || !u.prompting() {
+            return None;
+        }
+        let t = self.theme.clone();
+        let installable = u.can_install();
+        let release = u.available.clone();
+        let phase = u.phase.clone();
+        let (title, body): (String, String) = match (&release, &phase) {
+            (None, _) if u.checking => ("Checking for updates…".into(), String::new()),
+            (None, _) => ("You're up to date".into(), concat!("Puzil ", env!("CARGO_PKG_VERSION"), " is the latest version.").into()),
+            (Some(r), Phase::Idle) => (format!("Puzil {} is available", r.version), concat!("You have ", env!("CARGO_PKG_VERSION"), ".").into()),
+            (Some(r), Phase::Downloading(n)) => (format!("Downloading Puzil {}…", r.version), format!("{n}%")),
+            (Some(_), Phase::Installing) => ("Installing…".into(), "Puzil will restart in a moment.".into()),
+            (Some(_), Phase::Failed(msg)) => ("The update didn't install".into(), msg.clone()),
+        };
+        let progress = match phase {
+            Phase::Downloading(n) => Some(n as f32 / 100.),
+            Phase::Installing => Some(1.),
+            _ => None,
+        };
+        let primary = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_3()
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .bg(t.accent)
+                .text_color(white())
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.9))
+                .child(label)
+        };
+        let quiet = |id: &'static str, label: &'static str| {
+            let hover = t.fg_strong;
+            div().id(id).px_2().h(px(30.)).flex().items_center().text_size(px(13.)).text_color(t.muted).cursor_pointer().hover(move |s| s.text_color(hover)).child(label)
+        };
+        let page = release.as_ref().map(|r| r.page.clone());
+        let actions = match (&release, &phase) {
+            (Some(_), Phase::Idle) if installable => Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_end()
+                    .gap_1()
+                    .child(quiet("upd-later", "Later").on_click(|_, _, cx| updates::dismiss(cx)))
+                    .child(primary("upd-go", "Update and restart").on_click(|_, _, cx| updates::install(cx))),
+            ),
+            (Some(_), Phase::Idle | Phase::Failed(_)) => {
+                let page = page.clone().unwrap_or_default();
+                Some(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap_1()
+                        .child(quiet("upd-later", "Later").on_click(|_, _, cx| updates::dismiss(cx)))
+                        .child(primary("upd-page", "Download").on_click(move |_, _, cx| cx.open_url(&page))),
+                )
+            }
+            _ => None,
+        };
+        let card = div()
+            .id("update-prompt")
+            .occlude()
+            .w(px(300.))
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded(px(10.))
+            .bg(t.popover)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap_3()
+                    .child(gpui_kit::img(ImageSource::Render(crate::icons::app_icon(36.))).size(px(36.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(t.fg_strong).child(title))
+                            .when(!body.is_empty(), |d| d.child(div().text_size(px(13.)).text_color(t.muted).child(body))),
+                    ),
+            )
+            .children(progress.map(|f| {
+                div().h(px(4.)).w_full().rounded_full().bg(t.bg_selected).child(div().h_full().w(relative(f)).rounded_full().bg(t.accent))
+            }))
+            .children(actions);
+        Some(div().absolute().top(px(56.)).right(px(16.)).child(super::motion::pop_in("update-prompt-in", card)).into_any_element())
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let switcher = self.switcher.as_ref().map(|(sw, _)| {
@@ -419,6 +530,7 @@ impl Render for Workspace {
                     )
                     .child(div().text_color(t.muted).child("Pick a topic or a direct message from the sidebar.")),
             })
+            .children(self.render_update_prompt(cx))
             .children(switcher)
             .children(lightbox)
     }

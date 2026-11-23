@@ -8,12 +8,13 @@ use gpui_kit::{
 
 use crate::ui::workspace::{OpenSearch, OpenSettings, QuickSwitch, ShowAbout};
 
-actions!(puzil_app, [Hide, HideOthers, ShowAll, Minimize, Zoom, RevealLogs]);
+actions!(puzil_app, [Hide, HideOthers, ShowAll, Minimize, Zoom, RevealLogs, CheckForUpdates]);
 
 pub fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &CheckForUpdates, cx| crate::updates::check_now(cx));
     cx.on_action(|_: &RevealLogs, cx| cx.reveal_path(&crate::accounts::log_dir().join("puzil.log")));
     cx.bind_keys([
         KeyBinding::new("cmd-h", Hide, None),
@@ -24,6 +25,7 @@ pub fn init(cx: &mut App) {
     cx.set_menus([
         Menu::new("Puzil").items([
             MenuItem::action("About Puzil", ShowAbout),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
