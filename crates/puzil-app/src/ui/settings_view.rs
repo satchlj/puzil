@@ -489,7 +489,7 @@ impl SettingsView {
             |this, v, cx| this.change(move |l| l.mode = Some(v), cx),
         );
         let mode_info = self.layer_info("mode", layer.mode.is_some(), format!("{:?}", app_eff.mode), cx, |l| l.mode = None);
-        out.push(self.row("Mode", Some("Light, dark, or follow macOS."), mode, mode_info).into_any_element());
+        out.push(self.row("Mode", Some(&format!("Light, dark, or follow {}.", crate::platform::OS_NAME)), mode, mode_info).into_any_element());
         let clock = self.segmented("clock", &[("12-hour", false), ("24-hour", true)], &eff.clock_24h, cx, |this, v, cx| {
             this.change(move |l| l.clock_24h = Some(v), cx)
         });
@@ -503,7 +503,7 @@ impl SettingsView {
             |this, v, cx| this.change(move |l| l.motion = Some(v), cx),
         );
         let motion_info = self.layer_info("motion", layer.motion.is_some(), format!("{:?}", app_eff.motion), cx, |l| l.motion = None);
-        out.push(self.row("Motion", Some("Animations follow macOS's Reduce Motion unless set here."), motion, motion_info).into_any_element());
+        out.push(self.row("Motion", Some(if cfg!(target_os = "macos") { "Animations follow macOS's Reduce Motion unless set here." } else { "Animations follow the system's reduced-motion setting unless set here." }), motion, motion_info).into_any_element());
         let _ = app;
         out
     }
@@ -700,7 +700,7 @@ impl SettingsView {
         out.push(
             self.row(
                 &format!("Sign out of {server}"),
-                Some("Removes this server from Puzil and its key from the Keychain. Your messages stay on the server."),
+                Some(&format!("Removes this server from Puzil and its key from {}. Your messages stay on the server.", crate::platform::SECRET_STORE)),
                 small_button("sign-out", "Sign out", true).on_click(cx.listener(move |this, _, window, cx| {
                     let account = this.session.read(cx).account.clone();
                     let answer = window.prompt(PromptLevel::Warning, "Sign out of this server?", None, &["Sign out", "Cancel"], cx);
@@ -845,7 +845,7 @@ impl SettingsView {
                     .hover(|s| s.bg(t.bg_selected))
                     .text_size(px(13.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child("Show in Finder")
+                    .child(crate::platform::SHOW_IN_FILES)
                     .on_click(move |_, _, cx| cx.reveal_path(&open_dir)),
                 None,
             )
@@ -869,7 +869,7 @@ impl SettingsView {
                     .hover(|s| s.bg(t.bg_selected))
                     .text_size(px(13.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child("Show in Finder")
+                    .child(crate::platform::SHOW_IN_FILES)
                     .on_click(move |_, _, cx| cx.reveal_path(&log)),
                 None,
             )
@@ -877,9 +877,9 @@ impl SettingsView {
         );
         out.push(self.heading("Keyboard shortcuts").into_any_element());
         for (keys, what) in [
-            ("⌘K", "Jump to a channel, topic or person"),
-            ("⌘F", "Search messages"),
-            ("⌘,", "Settings"),
+            (key!("K"), "Jump to a channel, topic or person"),
+            (key!("F"), "Search messages"),
+            (key!(","), "Settings"),
             ("↑ in an empty composer", "Select the newest message"),
             ("↑ / ↓", "Move between messages"),
             ("Enter", "Edit the selected message (yours)"),
