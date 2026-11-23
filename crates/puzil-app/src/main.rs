@@ -7,6 +7,8 @@
 //! real account). Data (accounts, per-account SQLite, a file secret store in debug builds) lives in
 //! `PUZIL_DATA_DIR`, by default the gitignored `reference/data/` for debug builds.
 
+#[macro_use]
+mod platform;
 mod accounts;
 mod dock;
 mod icons;
@@ -315,7 +317,7 @@ fn main() {
             cx.observe_keystrokes(|e, _, _| tracing::info!("key {:?} {:?} action={:?}", e.keystroke.key, e.keystroke.modifiers, e.action.as_ref().map(|a| a.name()))).detach();
         }
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([KeyBinding::new(chord!("q"), Quit, None)]);
         menus::init(cx);
         let bounds = menus::saved_bounds().unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(860.)), cx));
         let (_, root) = gpui_kit::open_window(
@@ -326,7 +328,7 @@ fn main() {
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(theme::TRAFFIC_LIGHTS_AT.0), px(theme::TRAFFIC_LIGHTS_AT.1))),
                 }),
-                app_id: Some("earth.benson.puzil".into()),
+                app_id: Some("com.satchlj.puzil".into()),
                 ..Default::default()
             },
             cx,

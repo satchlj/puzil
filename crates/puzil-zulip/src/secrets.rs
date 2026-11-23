@@ -12,7 +12,9 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use keyring_core::{CredentialStore, Entry, Error as KErr};
 
-const SERVICE: &str = "earth.benson.puzil";
+const SERVICE: &str = "com.satchlj.puzil";
+/// The service name before 0.1.3. A key found only there moves to [`SERVICE`] when read.
+const OLD_SERVICE: &str = "earth.benson.puzil";
 
 pub enum Secrets {
     Os(Arc<CredentialStore>),
@@ -66,7 +68,22 @@ impl Secrets {
         match self {
             Self::Os(s) => match Entry::new_in_store(s, SERVICE, account)?.get_password() {
                 Ok(v) => Ok(Some(v)),
-                Err(KErr::NoEntry) => Ok(None),
+                Err(KErr::NoEntry) => {
+                    let old = Entry::new_in_store(s, OLD_SERVICE, account)?;
+                    match old.get_password() {
+                        Ok(v) => {
+                            // Moved, then forgotten under the old name; if the move fails the
+                            // old copy stays, and the next read tries again.
+                            if Entry::new_in_store(s, SERVICE, account)?.set_password(&v).is_ok() {
+                                let _ = old.delete_credential();
+                                tracing::info!("moved a key to the {SERVICE} keychain service");
+                            }
+                            Ok(Some(v))
+                        }
+                        Err(KErr::NoEntry) => Ok(None),
+                        Err(e) => Err(e.into()),
+                    }
+                }
                 Err(e) => Err(e.into()),
             },
             Self::File(p) => Ok(read_file(p)?.remove(account)),
@@ -75,7 +92,11 @@ impl Secrets {
 
     pub fn delete(&self, account: &str) -> Result<()> {
         match self {
-            Self::Os(s) => match Entry::new_in_store(s, SERVICE, account)?.delete_credential() {
+            Self::Os(s) => match {
+                // Signing out also clears a key not yet moved from the old name.
+                let _ = Entry::new_in_store(s, OLD_SERVICE, account).map(|e| e.delete_credential());
+                Entry::new_in_store(s, SERVICE, account)?.delete_credential()
+            } {
                 Ok(()) | Err(KErr::NoEntry) => Ok(()),
                 Err(e) => Err(e.into()),
             },
@@ -136,6 +157,23 @@ fn write_file(p: &PathBuf, m: &BTreeMap<String, String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Touches the real OS keychain (a dummy item, removed again): run by hand with
+    /// `cargo test -p puzil-zulip -- --ignored moves_keys`.
+    #[test]
+    #[ignore]
+    fn moves_keys_from_the_old_service() {
+        use super::*;
+        let store = os_store().unwrap();
+        let account = "0 @ https://puzil-migration-test.invalid";
+        Entry::new_in_store(&store, OLD_SERVICE, account).unwrap().set_password("dummy").unwrap();
+        let secrets = Secrets::Os(store.clone());
+        assert_eq!(secrets.get(account).unwrap().as_deref(), Some("dummy"));
+        assert!(matches!(Entry::new_in_store(&store, OLD_SERVICE, account).unwrap().get_password(), Err(KErr::NoEntry)));
+        assert_eq!(Entry::new_in_store(&store, SERVICE, account).unwrap().get_password().unwrap(), "dummy");
+        secrets.delete(account).unwrap();
+        assert_eq!(secrets.get(account).unwrap(), None);
+    }
+
     #[test]
     fn file_store_roundtrip_and_mode() {
         let dir = std::env::temp_dir().join(format!("puzil-secrets-test-{}", std::process::id()));

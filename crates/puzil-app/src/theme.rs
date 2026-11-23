@@ -2,12 +2,13 @@
 
 use gpui_kit::*;
 
-/// Room kept clear at the top of a screen for the window's traffic lights.
-pub const TRAFFIC_LIGHTS: f32 = 38.;
+/// Room kept clear at the top of a screen for the window's traffic lights. Zero off macOS,
+/// where the desktop draws a title bar above the window instead.
+pub const TRAFFIC_LIGHTS: f32 = if cfg!(target_os = "macos") { 38. } else { 0. };
 /// Where the traffic lights sit: centred in the 48px header strip.
 pub const TRAFFIC_LIGHTS_AT: (f32, f32) = (16., 17.);
 /// Left inset that clears the traffic lights (macOS 26 draws them about 70px wide).
-pub const TRAFFIC_LIGHTS_WIDTH: f32 = 86.;
+pub const TRAFFIC_LIGHTS_WIDTH: f32 = if cfg!(target_os = "macos") { 86. } else { 16. };
 
 /// Makes an element drag the window (and zoom it on double-click), standing in for the
 /// title bar we don't have.
