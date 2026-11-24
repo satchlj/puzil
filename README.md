@@ -74,7 +74,10 @@ cargo run --release -p puzil-app       # run from source
 tools/macos/bundle.sh                  # build dist/Puzil.app and a zip
 tools/linux/install.sh                 # Linux: build and install for the current user
 tools/linux/appimage.sh                # Linux: build dist/Puzil-<version>-<arch>.AppImage
+tools/bench/run.py                     # benchmark offline against a copy of your data
 ```
+
+`tools/bench/run.py` runs the app in benchmark mode (`PUZIL_BENCH`): the network is off from the first line of `main`, so it can't send or mark anything. It opens your busiest cached conversations and scrolls them, and a headless pass times the store, search, rendering, math and event replay. It reports medians against a saved baseline (`--save-baseline`) and the targets in `docs/PLAN.md`.
 
 The bundle is signed with a `Puzil Self-Signed` code-signing certificate when your keychain has one, otherwise ad hoc. `PUZIL_SIGN_ID="Developer ID Application: …"` signs with hardened runtime; adding `PUZIL_NOTARY_PROFILE=<notarytool profile>` also notarizes.
 

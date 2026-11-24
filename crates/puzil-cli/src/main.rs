@@ -7,6 +7,8 @@
 //!     puzil sync [N]                register, store the snapshot, cache the newest N messages
 //!     puzil unreads --offline       print the unread tree from the store alone
 //!     puzil search QUERY            full-text search of cached messages (FTS5 syntax)
+//!     puzil bench [CORPUS] [REPLAY] time the offline pieces (store, search, render, math,
+//!                                   replay) and print JSON; never touches the network
 //!
 //! The store lives in `PUZIL_DATA_DIR`, by default the gitignored `reference/data/`.
 //! Credentials come from `PUZIL_ZULIPRC` or `~/.zuliprc` (Zulip's standard place).
@@ -229,6 +231,8 @@ fn replay(path: &str) -> Result<()> {
     }
 }
 
+mod bench;
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
@@ -260,8 +264,12 @@ fn main() -> Result<()> {
             rt.block_on(watch(Some((out, Duration::from_secs_f64(mins * 60.0)))))
         }
         Some("replay") => replay(args.get(1).context("replay FILE")?),
+        Some("bench") => {
+            let path = |i: usize| args.get(i).filter(|a| !a.is_empty()).map(PathBuf::from);
+            bench::run(path(1), path(2))
+        },
         _ => {
-            eprintln!("usage: puzil unreads [--offline] | watch | record OUT MINUTES | replay FILE | sync [N] | search QUERY");
+            eprintln!("usage: puzil unreads [--offline] | watch | record OUT MINUTES | replay FILE | sync [N] | search QUERY | bench [CORPUS] [REPLAY]");
             std::process::exit(2)
         }
     }

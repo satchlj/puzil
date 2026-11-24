@@ -165,8 +165,16 @@ impl Typesetter {
 
 pub type Outcome = Result<Arc<Rendered>, String>;
 
+/// How many finished formulas the engine keeps once idle (a few hundred bytes to ~20 KB each).
+const DONE_CAP: usize = 2000;
+
+/// How long the worker waits for more formulas before it frees the typesetter.
+const IDLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 struct Shared {
     done: HashMap<Key, Outcome>,
+    /// `done`'s keys, oldest first.
+    order: std::collections::VecDeque<Key>,
     pending: HashSet<Key>,
 }
 
@@ -179,7 +187,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(on_done: impl Fn(Key) + Send + 'static) -> Self {
-        let shared = Arc::new(Mutex::new(Shared { done: HashMap::new(), pending: HashSet::new() }));
+        let shared = Arc::new(Mutex::new(Shared { done: HashMap::new(), order: Default::default(), pending: HashSet::new() }));
         let (tx, rx) = mpsc::channel::<(Key, MathSource)>();
         let sh = shared.clone();
         std::thread::Builder::new()
@@ -188,7 +196,33 @@ impl Engine {
                 // Loading fonts and the typst library takes tens of ms: do it on the first
                 // job, not at app start.
                 let mut ts: Option<Typesetter> = None;
-                for (key, src) in rx {
+                loop {
+                    let (key, src) = match rx.recv_timeout(IDLE) {
+                        Ok(job) => job,
+                        // Idle: drop the typesetter and typst's memo caches (fonts, the
+                        // library, layouts: ~6 MB at rest after a few hundred formulas). The
+                        // next formula loads them again, here, in tens of ms.
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if ts.take().is_some() {
+                                typst::comemo::evict(0);
+                            }
+                            // Finished formulas are kept for revisits, up to DONE_CAP: the
+                            // oldest go first (views showing them hold their own copies; others
+                            // are typeset again if asked for).
+                            let mut s = sh.lock().unwrap();
+                            while s.done.len() > DONE_CAP
+                                && let Some(k) = s.order.pop_front()
+                            {
+                                s.done.remove(&k);
+                            }
+                            drop(s);
+                            match rx.recv() {
+                                Ok(job) => job,
+                                Err(_) => break,
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     let out = ts.get_or_insert_with(Typesetter::new).render(&src).map(Arc::new);
                     if let Err(e) = &out {
                         tracing::debug!("math failed ({e}): {}", src.tex);
@@ -196,7 +230,9 @@ impl Engine {
                     {
                         let mut s = sh.lock().unwrap();
                         s.pending.remove(&key);
-                        s.done.insert(key, out);
+                        if s.done.insert(key, out).is_none() {
+                            s.order.push_back(key);
+                        }
                     }
                     on_done(key);
                 }

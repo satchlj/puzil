@@ -82,6 +82,49 @@ fn snapshot_roundtrips_through_reopen() {
 }
 
 #[test]
+fn unread_changes_are_written_row_by_row() {
+    let db = TempDb::new("unreads");
+    let mut s = state();
+    {
+        let st = Store::open(&db.path()).unwrap();
+        st.write(writes_for(&s, &puzil_zulip::model::Changes { all: true, ..Default::default() }));
+        // A new unread message (an event), then message 5 read (a flag event).
+        let mut ch = s.apply_all(&parse_batch(&[msg(300, "Hello", "<p>hi</p>")]));
+        assert!(ch.unread_ids.contains(&300), "{ch:?}");
+        st.write(writes_for(&s, &ch));
+        ch = s.apply_all(&parse_batch(&[json!({"type": "update_message_flags", "op": "add", "flag": "read", "messages": [5], "all": false})]));
+        assert_eq!(ch.unread_ids, [5].into());
+        st.write(writes_for(&s, &ch));
+        st.flush();
+    }
+    let l = Store::open(&db.path()).unwrap().load_state().unwrap().unwrap();
+    assert_eq!(l.unread, s.unread);
+    assert!(l.unread.contains_key(&300) && !l.unread.contains_key(&5));
+    assert_eq!(l.mentions, s.mentions);
+}
+
+#[test]
+fn user_changes_are_written_one_by_one() {
+    let db = TempDb::new("users");
+    let mut s = state();
+    {
+        let st = Store::open(&db.path()).unwrap();
+        st.write(writes_for(&s, &puzil_zulip::model::Changes { all: true, ..Default::default() }));
+        let ch = s.apply_all(&parse_batch(&[
+            json!({"type": "realm_user", "op": "update", "person": {"user_id": 11, "full_name": "Ada L"}}),
+            json!({"type": "realm_user", "op": "add", "person": {"user_id": 12, "full_name": "Bo"}}),
+        ]));
+        assert_eq!(ch.user_ids, [11, 12].into());
+        st.write(writes_for(&s, &ch));
+        st.flush();
+    }
+    let l = Store::open(&db.path()).unwrap().load_state().unwrap().unwrap();
+    assert_eq!(l.users.len(), 3);
+    assert_eq!(l.users[&11].full_name, "Ada L");
+    assert_eq!(l.users[&10].full_name, "Me");
+}
+
+#[test]
 fn write_behind_messages_moves_deletes_and_search() {
     let db = TempDb::new("msgs");
     let st = Store::open(&db.path()).unwrap();
@@ -145,6 +188,47 @@ fn search_hits_snippets_filters_and_unsafe_input() {
     assert!(st.search_hits(&puzil_store::fts_words("\"latent AND ( NEAR"), None, None, 10).is_ok());
     // Filters alone.
     assert_eq!(ids(st.search_hits("", None, Some("t:1:"), 10).unwrap()), [201, 200]);
+}
+
+#[test]
+fn version_1_cache_gets_a_prefix_indexed_search_table() {
+    let db = TempDb::new("migrate");
+    {
+        let st = Store::open(&db.path()).unwrap();
+        let mut s = state();
+        st.write(writes_for(&s, &puzil_zulip::model::Changes { all: true, ..Default::default() }));
+        let ch = s.apply_all(&parse_batch(&[msg(300, "T", "<p>latent</p>"), msg(301, "T", "<p>lattice</p>")]));
+        st.write(writes_for(&s, &ch));
+        st.flush();
+    }
+    // Put the search table back as version 1 made it.
+    {
+        let c = rusqlite::Connection::open(db.path()).unwrap();
+        c.execute_batch(
+            "DROP TABLE messages_fts;
+             CREATE VIRTUAL TABLE messages_fts USING fts5(text, topic, content='messages', content_rowid='id',
+                 tokenize='unicode61 remove_diacritics 2');
+             INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let st = Store::open(&db.path()).unwrap();
+    let ids = |h: Vec<puzil_store::SearchHit>| h.iter().map(|h| h.message.id).collect::<Vec<_>>();
+    // The old table answers while the writer rebuilds it; flushing waits for the rebuild.
+    assert_eq!(ids(st.search_hits(&puzil_store::fts_words("l"), None, None, 10).unwrap()), [301, 300]);
+    st.flush();
+    assert_eq!(ids(st.search_hits(&puzil_store::fts_words("l"), None, None, 10).unwrap()), [301, 300]);
+    assert_eq!(ids(st.search_hits(&puzil_store::fts_words("late"), None, None, 10).unwrap()), [300]);
+    let c = rusqlite::Connection::open(db.path()).unwrap();
+    let sql: String = c.query_row("SELECT sql FROM sqlite_master WHERE name = 'messages_fts'", [], |r| r.get(0)).unwrap();
+    assert!(sql.contains("prefix"), "{sql}");
+    // New messages still reach the rebuilt table through the triggers.
+    let mut s = state();
+    let ch = s.apply_all(&parse_batch(&[msg(302, "T", "<p>lateral</p>")]));
+    st.write(writes_for(&s, &ch));
+    st.flush();
+    assert_eq!(ids(st.search_hits(&puzil_store::fts_words("later"), None, None, 10).unwrap()), [302]);
 }
 
 #[test]

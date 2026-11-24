@@ -27,7 +27,7 @@ use crate::{
     icons,
     math::MathReady,
     media::{Images, ImagesReady, ImgState},
-    session::{PendingState, Session, Updated},
+    session::{PendingState, Session, TypingChanged, Updated},
     theme::Theme,
 };
 
@@ -157,6 +157,11 @@ impl Conversation {
     pub fn new(session: Entity<Session>, target: Target, theme: Rc<Theme>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| Composer::new(session.clone(), target.clone(), theme.clone(), window, cx));
         let mut subs = vec![cx.subscribe(&session, |this, _, up: &Rc<Updated>, cx| this.on_update(up, cx))];
+        subs.push(cx.subscribe(&session, |this, _, e: &TypingChanged, cx| {
+            if this.conv() == Some(&e.0) {
+                cx.notify();
+            }
+        }));
         subs.push(cx.subscribe_in(&composer, window, |this, _, e: &ComposerEvent, window, cx| match e {
             ComposerEvent::Sent(t) => {
                 if *t != this.target {
@@ -1373,8 +1378,54 @@ fn decode_hash(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+impl Conversation {
+    /// Benchmark hooks: how many messages are laid out, and scrolling by hand.
+    pub fn bench_message_count(&self) -> usize {
+        self.items.borrow().iter().filter(|i| matches!(i, Item::Msg { .. })).count()
+    }
+
+    pub fn bench_scroll_top(&self) -> (usize, f32) {
+        let o = self.list.logical_scroll_top();
+        (o.item_ix, f32::from(o.offset_in_item))
+    }
+
+    /// "Ada is typing…" under the messages of a DM, in the list's bottom padding (taller in
+    /// DMs) so the list doesn't move when it comes and goes.
+    fn typing_line(&self, cx: &App) -> Option<Div> {
+        let c = self.conv()?;
+        let s = self.session.read(cx);
+        let who = s.typing_in(c);
+        let text = match who.as_slice() {
+            [] => return None,
+            [a] => format!("{} is typing…", s.state.user_name(*a)),
+            [a, b] => format!("{} and {} are typing…", s.state.user_name(*a), s.state.user_name(*b)),
+            _ => "Several people are typing…".to_string(),
+        };
+        Some(
+            div()
+                .absolute()
+                .bottom(px(3.))
+                .left(px(72.))
+                .right_4()
+                .h(px(16.))
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .text_color(self.theme.muted)
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(text),
+        )
+    }
+
+    pub fn bench_scroll_to_end(&self) {
+        self.list.scroll_to_end();
+    }
+}
+
 impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _timer = crate::bench::Timer::start("conversation_render_us");
         let menu = self.render_menu(window, cx);
         let profile = self.render_profile(cx);
         let picker = self.render_picker(cx);
@@ -1412,6 +1463,8 @@ impl Render for Conversation {
             .size_0()
         };
         let _ = window;
+        let typing = self.typing_line(cx);
+        let dm = matches!(self.conv(), Some(Conv::Dm(_)));
         div()
             .key_context("Conversation")
             .on_action(cx.listener(Self::copy_selection))
@@ -1427,7 +1480,7 @@ impl Render for Conversation {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .pb_3()
+                    .map(|d| if dm { d.pb(px(22.)) } else { d.pb_3() })
                     .key_context("MessageList")
                     .track_focus(&self.focus)
                     .on_action(cx.listener(Self::select_prev))
@@ -1449,7 +1502,8 @@ impl Render for Conversation {
                             }
                         })
                         .size_full(),
-                    ),
+                    )
+                    .children(typing),
             )
             .child(self.composer.clone())
             .child(probe)

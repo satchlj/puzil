@@ -10,6 +10,7 @@
 #[macro_use]
 mod platform;
 mod accounts;
+mod bench;
 mod dock;
 mod icons;
 mod instance;
@@ -22,12 +23,13 @@ mod servers;
 mod session;
 mod settings;
 mod theme;
+mod typing;
 mod ui;
 mod updates;
 
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Duration};
 
-use gpui_kit::*;
+use gpui_kit::{prelude::FluentBuilder as _, *};
 use puzil_zulip::{Client, Credentials};
 
 use crate::{
@@ -76,6 +78,7 @@ impl Root {
             }),
         ];
         let mut this = Self { servers: vec![], active: 0, login: None, failed: None, _subs: subs };
+        bench::mark("root_subscribed");
         let last = settings::handle(cx).read(cx).layer(&settings::Scope::App).last_server;
         for a in accounts::load() {
             match accounts::credentials(&a) {
@@ -91,6 +94,7 @@ impl Root {
         if this.servers.is_empty() {
             this.show_login(false, window, cx);
         }
+        bench::mark("root_created");
         this
     }
 
@@ -134,7 +138,9 @@ impl Root {
                 return;
             }
         };
+        bench::mark("store_opened");
         let session = cx.new(|cx| Session::new(a, Client::new(c), store, cx));
+        bench::mark("session_created");
         // A refused key is dead: forget it, and ask to sign in again if nothing's left.
         let sub = cx.observe_in(&session, window, |this, session, window, cx| {
             if let session::Status::SignedOut(why) = &session.read(cx).status {
@@ -144,6 +150,7 @@ impl Root {
             }
         });
         let workspace = cx.new(|cx| Workspace::new(session.clone(), window, cx));
+        bench::mark("workspace_created");
         self.servers.push(Server { session, workspace, _sub: sub });
         self.publish(cx);
     }
@@ -186,14 +193,30 @@ impl Root {
 static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 impl Render for Root {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        bench::frame_begins();
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| {
-            window.on_next_frame(|_, _| {
+            bench::mark("first_render");
+            window.on_next_frame(|_, cx| {
                 if let Some(t) = STARTED.get() {
                     tracing::info!("first frame {:.0?} after launch", t.elapsed());
+                    bench::record("first_frame_ms", bench::since_exec_ms());
                 }
+                // Launch work nothing in the first frame needs.
+                menus::install(cx);
+                dock::set_icon();
+                // The keyboard layout is looked up lazily (vendored gpui-pre-macos): do it
+                // shortly, in its own turn, rather than on the first keystroke.
+                cx.spawn(async |cx| {
+                    cx.background_executor().timer(Duration::from_millis(200)).await;
+                    let _ = cx.update(|cx| cx.keyboard_layout().id().len());
+                })
+                .detach();
             });
+            if bench::active() {
+                bench::start(cx.entity().downgrade(), window, cx);
+            }
         });
         let t = theme::Theme::for_appearance(window.appearance());
         let content = match (&self.login, self.servers.get(self.active), &self.failed) {
@@ -211,6 +234,7 @@ impl Render for Root {
             .on_action(|_: &menus::Minimize, window, _| window.minimize_window())
             .on_action(|_: &menus::Zoom, window, _| window.zoom_window())
             .child(content)
+            .when(bench::active(), |d| d.child(bench::frame_end_marker()))
     }
 }
 
@@ -245,7 +269,11 @@ fn init_logging() {
 
 fn main() {
     STARTED.get_or_init(std::time::Instant::now);
+    // Before any thread or HTTP client exists: benchmark mode turns the network off.
+    bench::prepare();
+    bench::mark("main");
     init_logging();
+    bench::mark("logging");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--import-zuliprc") {
         if let Err(e) = import_zuliprc(args.get(1).map(String::as_str).unwrap_or_default()) {
@@ -257,6 +285,7 @@ fn main() {
     let launch_urls: Vec<String> = args.iter().filter(|a| a.starts_with("zulip://")).cloned().collect();
     // Linux delivers scheme URLs as argv of a fresh process: hand them to the running instance.
     let Some(incoming) = instance::claim_or_forward(&launch_urls) else { return };
+    bench::mark("instance_claimed");
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tracing::debug!("creating app at {:.0?}", STARTED.get().map(|t| t.elapsed()).unwrap_or_default());
@@ -277,19 +306,29 @@ fn main() {
     }
     let since = || STARTED.get().map(|t| t.elapsed()).unwrap_or_default();
     tracing::debug!("app built at {:.0?}", since());
+    bench::mark("app_built");
     app.run(move |cx: &mut App| {
         tracing::debug!("run callback at {:.0?}", since());
+        bench::mark("run_callback");
         gpui_kit::init(cx);
-        dock::set_icon();
+        bench::mark("gpuikit_base");
+        // The caret stops blinking, visible, 10 s after the last keystroke or focus (GTK's
+        // default). A blinking caret redraws the window twice a second forever, and while
+        // the window keeps drawing macOS keeps ~48 MB of its GPU memory in the footprint.
+        gpui_kit::component::Theme::update(cx, |t| {
+            t.cursor_blink = gpui_kit::base::input::CursorBlink::blinking(Duration::from_millis(500)).with_idle_timeout(Duration::from_secs(10));
+        });
         settings::init(cx);
         servers::init(cx);
         updates::init(cx);
+        bench::mark("settings");
         {
             let e = settings::effective(cx, None);
             theme::Theme::choose(e.palette, e.mode);
             settings::apply_globals(&e, cx);
         }
         tracing::debug!("gpui-kit init done at {:.0?}", since());
+        bench::mark("gpuikit_init_done");
         // Figtree (UI and messages), Unbounded (display) and JetBrains Mono (code), all OFL;
         // Discord's own gg sans, Ginto Nord and gg mono aren't licensed for this.
         cx.text_system()
@@ -305,6 +344,7 @@ fn main() {
                 Cow::Borrowed(include_bytes!("../../../assets/fonts/JetBrainsMono-Bold.ttf")),
             ])
             .expect("bundled fonts");
+        bench::mark("fonts");
         cx.bind_keys([
             KeyBinding::new("cmd-c", CopySelection, Some("Conversation")),
             KeyBinding::new("ctrl-c", CopySelection, Some("Conversation")),
@@ -319,7 +359,10 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new(chord!("q"), Quit, None)]);
         menus::init(cx);
-        let bounds = menus::saved_bounds().unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(860.)), cx));
+        bench::mark("menus");
+        // A benchmark always runs at the same size, so runs compare.
+        let saved = if bench::active() { None } else { menus::saved_bounds() };
+        let bounds = saved.unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(860.)), cx));
         let (_, root) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -334,11 +377,13 @@ fn main() {
             cx,
             |window, cx| {
                 menus::attach(window, cx);
+                bench::mark("window_created");
                 cx.new(|cx| Root::new(window, cx))
             },
         )
         .expect("window");
         tracing::debug!("window opened at {:.0?}", since());
+        bench::mark("window_opened");
         cx.spawn(async move |cx| {
             while let Some(url) = rx.recv().await {
                 let _ = root.update(cx, |r, cx| r.on_url(url, cx));

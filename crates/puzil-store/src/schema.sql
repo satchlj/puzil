@@ -34,8 +34,10 @@ CREATE TABLE overlay_votes (message_id INTEGER PRIMARY KEY, json TEXT NOT NULL, 
 CREATE TABLE overlay_inline (message_id INTEGER PRIMARY KEY, json TEXT NOT NULL, fetched INTEGER NOT NULL);
 
 -- External-content FTS: the index stores only tokens; text lives in `messages`.
+-- prefix: search runs as you type, and a one- or two-letter prefix otherwise scans every
+-- term that starts with it (version 2).
 CREATE VIRTUAL TABLE messages_fts USING fts5(text, topic, content='messages', content_rowid='id',
-                                             tokenize='unicode61 remove_diacritics 2');
+                                             tokenize='unicode61 remove_diacritics 2', prefix='1 2');
 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
   INSERT INTO messages_fts(rowid, text, topic) VALUES (new.id, new.text, new.topic);
 END;

@@ -11,7 +11,7 @@ use super::{
     sidebar::{Sidebar, SidebarEvent},
 };
 use crate::{
-    media::{ImgState, fit},
+    media::{Fit, ImgState, fit},
     session::Session,
     theme::Theme,
 };
@@ -146,6 +146,11 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// The open conversation, for the benchmark driver.
+    pub fn current_conversation(&self) -> Option<Entity<Conversation>> {
+        self.conversation.clone()
+    }
+
     /// Whether this server is the one showing. Only the active workspace sets the theme.
     pub fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.active = active;
@@ -252,7 +257,11 @@ impl Workspace {
     }
 
     fn close_lightbox(&mut self, _: &CloseLightbox, window: &mut Window, cx: &mut Context<Self>) {
-        self.lightbox = None;
+        // The original is big; the inline copy is enough until it's opened again.
+        if let Some(full) = self.lightbox.take().and_then(|m| m.href) {
+            let images = self.session.read(cx).images.clone();
+            images.update(cx, |i, _| i.forget_full(&full));
+        }
         if let Some(c) = &self.conversation {
             c.update(cx, |c, cx| c.composer().update(cx, |comp, cx| comp.focus(window, cx)));
         }
@@ -265,15 +274,15 @@ impl Workspace {
         let images = self.session.read(cx).images.clone();
         let client = self.session.read(cx).client.clone();
         let full = m.href.clone().filter(|h| is_image_path(h));
-        let mut get = |u: &Option<String>| match u {
-            Some(u) => match images.update(cx, |i, cx| i.get(u, cx)) {
+        let mut get = |u: &Option<String>, fit: Fit| match u {
+            Some(u) => match images.update(cx, |i, cx| i.get_fit(u, fit, cx)) {
                 ImgState::Ready(img) => Some(img),
                 _ => None,
             },
             None => None,
         };
-        let shown = get(&full).or_else(|| get(&m.src));
-        let loading_full = full.is_some() && images.read(cx).peek(full.as_deref().unwrap_or_default()).is_none();
+        let shown = get(&full, Fit::Full).or_else(|| get(&m.src, Fit::Inline));
+        let loading_full = full.is_some() && images.read(cx).peek_fit(full.as_deref().unwrap_or_default(), Fit::Full).is_none();
         let vp = window.viewport_size();
         let (max_w, max_h) = (f32::from(vp.width) - 96., f32::from(vp.height) - 128.);
         let dims = m.dims.or_else(|| shown.as_ref().map(|i| (i.size(0).width.0 as u32, i.size(0).height.0 as u32)));
@@ -489,7 +498,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.show_settings(super::settings_view::Section::Appearance, window, cx)))
             .on_action(cx.listener(|this, _: &ShowAbout, window, cx| this.show_settings(super::settings_view::Section::Advanced, window, cx)))
-            .child(self.sidebar.clone())
+            // The sidebar redraws only when something it shows changes (GPUI reuses its last
+            // frame otherwise): scrolling a conversation used to lay it out and paint it again
+            // every frame, ~10% of the work.
+            .child(match self.sidebar.read(cx).cached_width() {
+                Some(w) => AnyView::from(self.sidebar.clone()).cached(StyleRefinement::default().w(px(w)).h_full().flex_none()).into_any_element(),
+                None => self.sidebar.clone().into_any_element(),
+            })
             .child(match (&self.browser, &self.conversation) {
                 _ if self.welcome.is_some() => {
                     div().flex_1().min_w_0().h_full().children(self.welcome.as_ref().map(|(w, _)| w.clone()))
