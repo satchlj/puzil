@@ -66,6 +66,10 @@ pub enum ConversationEvent {
         topic: Option<String>,
         body: String,
     },
+    /// Open the Move dialog: how, which topic, and a message in it.
+    Move(super::move_dialog::MoveMode, TopicKey, MessageId),
+    /// Show a channel's settings.
+    ChannelSettings(puzil_zulip::types::StreamId),
 }
 
 mod menu;
@@ -108,6 +112,10 @@ pub struct Conversation {
     list_focused: bool,
     /// The open right-click menu: its message and where it was opened.
     menu: Option<(MessageId, Point<Pixels>)>,
+    /// The header's topic menu (⋯), and where it was opened.
+    topic_menu: Option<Point<Pixels>>,
+    /// When a click outside closed it: the same click on ⋯ mustn't reopen it.
+    topic_menu_closed: Option<std::time::Instant>,
     /// The open profile card: whose, and where it was opened.
     profile: Option<(u64, Point<Pixels>)>,
     /// The profile card's message box, and whether a message went out from it.
@@ -212,6 +220,8 @@ impl Conversation {
             kb_selected: None,
             list_focused: false,
             menu: None,
+            topic_menu: None,
+            topic_menu_closed: None,
             profile: None,
             profile_input: None,
             profile_sent: false,
@@ -746,6 +756,12 @@ impl Conversation {
         // Only when there's nothing to show yet: a refresh behind cached messages is silent.
         let loading = self.conv().and_then(|c| s.conv_data(c)).is_some_and(|d| d.loading)
             && !self.items.borrow().iter().any(|i| matches!(i, Item::Msg { .. }));
+        let sid = match &self.target {
+            Target::Conv(Conv::Topic(k)) => Some(k.stream_id),
+            Target::NewTopic(sid) => Some(*sid),
+            _ => None,
+        };
+        let is_topic = matches!(self.target, Target::Conv(Conv::Topic(_)));
         let lead: AnyElement = match &title {
             Title::Topic { channel, private, topic, description } => div()
                 .flex()
@@ -753,8 +769,27 @@ impl Conversation {
                 .items_center()
                 .gap_1p5()
                 .min_w_0()
-                .child(icons::channel(*private, 22., t.faint, t.bg))
-                .child(div().flex_none().text_color(t.muted).font_weight(FontWeight::SEMIBOLD).child(channel.clone()))
+                // The channel opens its settings.
+                .child(
+                    div()
+                        .id("header-channel")
+                        .flex()
+                        .flex_row()
+                        .flex_none()
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .group("header-channel")
+                        .child(icons::channel(*private, 22., t.faint, t.bg))
+                        .child(
+                            div()
+                                .text_color(t.muted)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .group_hover("header-channel", |s| s.text_color(t.fg_strong).underline())
+                                .child(channel.clone()),
+                        )
+                        .when_some(sid, |d, sid| d.on_click(cx.listener(move |_, _, _, cx| cx.emit(ConversationEvent::ChannelSettings(sid))))),
+                )
                 .child(icons::icon("chevron-right", 16., t.faint))
                 .child(
                     div()
@@ -831,6 +866,27 @@ impl Conversation {
             .when_some(error, |d, e| d.child(div().flex_none().text_color(t.danger).text_size(px(13.)).child(e)))
             .child(crate::theme::drag_region(div().id("header-drag").flex_1().h_full()))
             .children(votes)
+            .when(is_topic, |d| {
+                d.child(
+                    div()
+                        .id("topic-menu-button")
+                        .flex_none()
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.bg_hover))
+                        .child(icons::icon("ellipsis", 18., t.icon))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            let just_closed = this.topic_menu_closed.take().is_some_and(|t| t.elapsed().as_millis() < 250);
+                            this.topic_menu = if this.topic_menu.is_some() || just_closed { None } else { Some(e.position) };
+                            cx.notify();
+                        })),
+                )
+            })
     }
 
     /// The top of a conversation's history: Discord's big welcome.
@@ -1427,6 +1483,7 @@ impl Render for Conversation {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _timer = crate::bench::Timer::start("conversation_render_us");
         let menu = self.render_menu(window, cx);
+        let topic_menu = self.render_topic_menu(window, cx);
         let profile = self.render_profile(cx);
         let picker = self.render_picker(cx);
         self.list_focused = self.focus.is_focused(window);
@@ -1508,6 +1565,7 @@ impl Render for Conversation {
             .child(self.composer.clone())
             .child(probe)
             .children(menu)
+            .children(topic_menu)
             .children(profile)
             .children(picker)
     }

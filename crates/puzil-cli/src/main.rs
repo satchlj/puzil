@@ -132,7 +132,7 @@ fn describe(e: &puzil_zulip::events::Event) -> String {
     match e {
         Message { message, flags } => format!("message {} from {} read={}", message.id, message.sender_full_name, flags.iter().any(|f| f == "read")),
         UpdateMessage(u) => format!("update_message {:?} move={}", u.message_id, u.is_move()),
-        DeleteMessage { message_ids } => format!("delete {message_ids:?}"),
+        DeleteMessage { message_ids, .. } => format!("delete {message_ids:?}"),
         UpdateMessageFlags(f) => format!("flags {} {} on {} message(s){}", f.op, f.flag, f.messages.len(), if f.all { " (all)" } else { "" }),
         Reaction { add, message_id, reaction } => format!("reaction {} :{}: on {message_id}", if *add { "+" } else { "-" }, reaction.emoji_name),
         Other { kind, .. } => format!("(unmodeled) {kind}"),

@@ -46,6 +46,8 @@ pub struct Prefs {
     pub show_muted_channels: Option<bool>,
     pub auto_read: Option<bool>,
     pub group_minutes: Option<u32>,
+    /// Dragging a topic onto a channel in the sidebar opens Move topic.
+    pub drag_topics: Option<bool>,
     /// The welcome (theme choice) has been shown. App layer only.
     pub onboarded: Option<bool>,
     /// The server that was showing last (its realm URL). App layer only.
@@ -64,6 +66,7 @@ pub struct Effective {
     pub show_muted_channels: bool,
     pub auto_read: bool,
     pub group_minutes: u32,
+    pub drag_topics: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -152,6 +155,7 @@ impl Settings {
             show_muted_channels: pick!(show_muted_channels, true),
             auto_read: pick!(auto_read, std::env::var_os("PUZIL_NO_AUTO_READ").is_none()),
             group_minutes: pick!(group_minutes, 7),
+            drag_topics: pick!(drag_topics, false),
         }
     }
 

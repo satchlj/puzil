@@ -20,6 +20,10 @@ pub enum ApiError {
     RateLimited(Duration),
     #[error("{code}: {msg} (HTTP {status})")]
     Api { status: u16, code: String, msg: String },
+    /// A move reached back past the organization's time limit. Retrying with `change_later`
+    /// from `first_allowed` moves the part that is allowed.
+    #[error("{msg}")]
+    MoveTimeLimit { msg: String, first_allowed: Option<u64>, allowed: u64, total: u64 },
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
     #[error("bad response: {0}")]
@@ -109,6 +113,12 @@ impl Client {
         Err(match (status.as_u16(), code.as_str()) {
             (_, "BAD_EVENT_QUEUE_ID") => ApiError::BadEventQueue,
             (401, _) | (_, "UNAUTHORIZED") | (_, "USER_DEACTIVATED") | (_, "REALM_DEACTIVATED") => ApiError::Unauthorized(msg),
+            (_, "MOVE_MESSAGES_TIME_LIMIT_EXCEEDED") => ApiError::MoveTimeLimit {
+                msg,
+                first_allowed: v["first_message_id_allowed_to_move"].as_u64(),
+                allowed: v["total_messages_allowed_to_move"].as_u64().unwrap_or(0),
+                total: v["total_messages_in_topic"].as_u64().unwrap_or(0),
+            },
             (429, _) | (_, "RATE_LIMIT_HIT") => ApiError::RateLimited(
                 retry_after.or_else(|| v["retry-after"].as_f64().map(Duration::from_secs_f64)).unwrap_or(Duration::from_secs(5)),
             ),
@@ -405,6 +415,86 @@ impl Client {
         self.send_method(reqwest::Method::DELETE, "users/me/subscriptions", &[("subscriptions", json(names))]).await.map(drop)
     }
 
+    /// Moves messages to another topic and/or channel, starting from `message`:
+    /// `scope` is `change_one`, `change_later` or `change_all`.
+    pub async fn move_messages(&self, m: &MoveRequest) -> ApiResult<()> {
+        let mut p = vec![
+            ("propagate_mode", m.scope.to_string()),
+            ("send_notification_to_old_thread", m.notify_old.to_string()),
+            ("send_notification_to_new_thread", m.notify_new.to_string()),
+        ];
+        if let Some(t) = &m.topic {
+            p.push(("topic", t.clone()));
+        }
+        if let Some(sid) = m.stream_id {
+            p.push(("stream_id", sid.to_string()));
+        }
+        self.send_method(reqwest::Method::PATCH, &format!("messages/{}", m.message), &p).await.map(drop)
+    }
+
+    /// Deletes every message in a topic. The server works in batches, so this repeats until
+    /// it reports the topic gone.
+    pub async fn delete_topic(&self, stream_id: u64, topic: &str) -> ApiResult<()> {
+        for _ in 0..100 {
+            let v = self.post_value(&format!("streams/{stream_id}/delete_topic"), &[("topic_name", topic.to_string())]).await?;
+            if v["complete"].as_bool() != Some(false) {
+                return Ok(());
+            }
+        }
+        Err(ApiError::Decode("delete_topic: still incomplete after 100 batches".into()))
+    }
+
+    /// Creates a channel and returns its id.
+    pub async fn create_channel(&self, c: &NewChannel) -> ApiResult<u64> {
+        let mut p = vec![
+            ("name", c.name.clone()),
+            ("description", c.description.clone()),
+            ("subscribers", json(&c.subscribers)),
+            ("invite_only", c.invite_only.to_string()),
+            ("is_web_public", c.is_web_public.to_string()),
+            ("history_public_to_subscribers", c.history_public_to_subscribers.to_string()),
+        ];
+        if let Some(f) = c.folder_id {
+            p.push(("folder_id", f.to_string()));
+        }
+        let v = self.post_value("channels/create", &p).await?;
+        v["id"].as_u64().or_else(|| v["stream_id"].as_u64()).ok_or_else(|| ApiError::Decode("create channel: no id".into()))
+    }
+
+    /// Changes channel settings (`PATCH /streams/{id}`): `new_name`, `description`,
+    /// `is_private`, `folder_id`, a `can_*_group` as `{"new": …}`, and so on.
+    pub async fn update_channel(&self, stream_id: u64, params: &[(&str, String)]) -> ApiResult<()> {
+        self.send_method(reqwest::Method::PATCH, &format!("streams/{stream_id}"), params).await.map(drop)
+    }
+
+    pub async fn archive_channel(&self, stream_id: u64) -> ApiResult<()> {
+        self.send_method(reqwest::Method::DELETE, &format!("streams/{stream_id}"), &[]).await.map(drop)
+    }
+
+    /// Who is subscribed to a channel.
+    pub async fn channel_members(&self, stream_id: u64) -> ApiResult<Vec<u64>> {
+        let v = self.get_value(&format!("streams/{stream_id}/members"), &[], None).await?;
+        Ok(v["subscribers"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).collect())
+    }
+
+    /// Subscribes other people to a channel (they get Zulip's notification DM).
+    pub async fn add_subscribers(&self, channel: &str, users: &[u64]) -> ApiResult<()> {
+        let subs = serde_json::json!([{ "name": channel }]);
+        self.post_value("users/me/subscriptions", &[("subscriptions", json(subs)), ("principals", json(users))]).await.map(drop)
+    }
+
+    pub async fn remove_subscribers(&self, channel: &str, users: &[u64]) -> ApiResult<()> {
+        self.send_method(reqwest::Method::DELETE, "users/me/subscriptions", &[("subscriptions", json([channel])), ("principals", json(users))])
+            .await
+            .map(drop)
+    }
+
+    /// Adds or removes a channel from the ones new users join.
+    pub async fn set_default_channel(&self, stream_id: u64, on: bool) -> ApiResult<()> {
+        let m = if on { reqwest::Method::POST } else { reqwest::Method::DELETE };
+        self.send_method(m, "default_streams", &[("stream_id", stream_id.to_string())]).await.map(drop)
+    }
+
     pub async fn react(&self, id: u64, add: bool, name: &str, code: &str, kind: &str) -> ApiResult<()> {
         let p = [("emoji_name", name.to_string()), ("emoji_code", code.to_string()), ("reaction_type", kind.to_string())];
         let m = if add { reqwest::Method::POST } else { reqwest::Method::DELETE };
@@ -463,4 +553,26 @@ impl Client {
             self.get("messages", &[("message_ids", json(ids)), ("apply_markdown", "false".into())]).await?;
         Ok(page.messages)
     }
+}
+
+/// A move: which messages (from `message`, by `scope`), and where to.
+#[derive(Debug, Clone)]
+pub struct MoveRequest {
+    pub message: u64,
+    pub scope: &'static str,
+    pub stream_id: Option<u64>,
+    pub topic: Option<String>,
+    pub notify_old: bool,
+    pub notify_new: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewChannel {
+    pub name: String,
+    pub description: String,
+    pub subscribers: Vec<u64>,
+    pub invite_only: bool,
+    pub is_web_public: bool,
+    pub history_public_to_subscribers: bool,
+    pub folder_id: Option<i64>,
 }

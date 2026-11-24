@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "auth-spike"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "math-bakeoff"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6137,7 +6137,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6165,14 +6165,14 @@ dependencies = [
 
 [[package]]
 name = "puzil-avatar"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "image",
 ]
 
 [[package]]
 name = "puzil-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "puzil-math",
@@ -6186,7 +6186,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-math"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "mitex",
@@ -6202,7 +6202,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-overlay"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "puzil-zulip",
  "reqwest",
@@ -6214,7 +6214,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-render"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ego-tree",
  "scraper",
@@ -6223,7 +6223,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-store"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "puzil-zulip",
@@ -6235,7 +6235,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-zulip"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6781,7 +6781,7 @@ dependencies = [
 
 [[package]]
 name = "richtext-list"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "gpui-kit",

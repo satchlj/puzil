@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use crate::{
     client::{ApiError, Client, json},
     events::{Event, parse_batch},
-    types::Register,
+    types::{RealmPerms, Register},
 };
 
 /// Event types we subscribe to. `fetch_event_types` adds the initial-state-only keys.
@@ -30,9 +30,13 @@ pub const EVENT_TYPES: &[&str] = &[
     // leaves out channel typing, which would wake the app for every keystroke anywhere.
     "typing",
     "channel_folder",
+    // Organization settings, user groups and default channels: what Puzil lets you do.
+    "realm",
+    "user_group",
+    "default_streams",
 ];
 
-const FETCH_ONLY: &[&str] = &["unread_msgs", "realm", "recent_private_conversations", "realm_user_groups", "user_settings", "channel_folders"];
+const FETCH_ONLY: &[&str] = &["unread_msgs", "recent_private_conversations", "realm_user_groups", "user_settings", "channel_folders"];
 
 pub enum Update {
     /// A fresh register. After the first one, this means the old queue was lost: the
@@ -71,7 +75,8 @@ pub async fn register(client: &Client) -> Result<(Register, Value), ApiError> {
             ],
         )
         .await?;
-    let reg: Register = crate::client::decode(raw.clone())?;
+    let mut reg: Register = crate::client::decode(raw.clone())?;
+    reg.perms = RealmPerms::from_register(&raw);
     Ok((reg, raw))
 }
 

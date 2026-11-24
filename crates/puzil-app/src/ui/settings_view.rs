@@ -547,6 +547,10 @@ impl SettingsView {
         let toggle = self.toggle("muted-chans", on).on_click(cx.listener(move |this, _, _, cx| this.change(move |l| l.show_muted_channels = Some(!on), cx)));
         let info = self.layer_info("muted-chans", layer.show_muted_channels.is_some(), if def.show_muted_channels { "shown" } else { "hidden" }.into(), cx, |l| l.show_muted_channels = None);
         out.push(self.row("Show muted channels", Some("Muted channels stay in the sidebar, dimmed. Off hides them."), toggle, info).into_any_element());
+        let on = eff.drag_topics;
+        let toggle = self.toggle("drag-topics", on).on_click(cx.listener(move |this, _, _, cx| this.change(move |l| l.drag_topics = Some(!on), cx)));
+        let info = self.layer_info("drag-topics", layer.drag_topics.is_some(), if def.drag_topics { "on" } else { "off" }.into(), cx, |l| l.drag_topics = None);
+        out.push(self.row("Drag topics to move them", Some("Drop a topic on a channel to open Move topic with that channel chosen."), toggle, info).into_any_element());
         out
     }
 

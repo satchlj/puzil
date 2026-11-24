@@ -128,8 +128,8 @@ pub fn writes_for(state: &State, changes: &Changes) -> Vec<Write> {
     if changes.all || changes.streams {
         w.push(Write::Streams { streams: state.streams.values().cloned().collect(), subs: state.subs.values().cloned().collect() });
     }
-    if changes.all || changes.streams {
-        // Channel folders live in the realm record.
+    if changes.all || changes.streams || changes.realm {
+        // Channel folders, permissions and user groups live in the realm record.
         w.push(Write::Meta { key: "realm".into(), value: serde_json::to_string(&state.realm).unwrap_or_default() });
     }
     if changes.all {

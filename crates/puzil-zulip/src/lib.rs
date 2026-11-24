@@ -5,6 +5,7 @@ pub mod auth;
 pub mod client;
 pub mod events;
 pub mod model;
+pub mod perms;
 pub mod queue;
 pub mod replay;
 pub mod secrets;
