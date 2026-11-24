@@ -26,6 +26,11 @@ pub fn init(cx: &mut App) {
         // ⌘, on macOS, Ctrl+, elsewhere.
         KeyBinding::new(chord!(","), OpenSettings, None),
     ]);
+}
+
+/// The menu bar. Installed after the first frame: building it costs ~8 ms of launch, and
+/// nobody reaches for a menu in the first frame's time.
+pub fn install(cx: &mut App) {
     cx.set_menus([
         Menu::new("Puzil").items([
             MenuItem::action("About Puzil", ShowAbout),

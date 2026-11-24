@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::*;
@@ -18,12 +18,26 @@ use puzil_zulip::{
     ApiError, Client, State,
     client::{Anchor, TopicInfo},
     events::Event,
-    model::{Changes, Conv, conv_of},
+    model::{Changes, Conv, DmKey, conv_of},
     queue::{self, Update},
-    types::{Message, MessageId, StreamId},
+    types::{Message, MessageId, StreamId, UserId},
 };
 
-use crate::{accounts::Account, runtime::on_tokio};
+use crate::{
+    accounts::Account,
+    runtime::on_tokio,
+    typing::{Notice, Typing},
+};
+
+/// Messages held in memory before [`Session::trim`] lets some go, and how many it keeps.
+const TRIM_AT: usize = 5000;
+const TRIM_TO: usize = 3000;
+
+/// How long message times wait after a failed request before they're asked for again.
+const TIMES_RETRY: Duration = Duration::from_secs(60);
+
+/// How long a channel whose topics failed to load waits before the next try.
+const TOPICS_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
@@ -56,6 +70,10 @@ impl Updated {
         }
     }
 }
+
+/// Who's typing in this DM changed. Separate from [`Updated`] so it redraws only the
+/// conversation showing it.
+pub struct TypingChanged(pub Conv);
 
 #[derive(Debug, Default)]
 pub struct ConvData {
@@ -103,14 +121,22 @@ pub struct Session {
     conv_of_id: HashMap<MessageId, Conv>,
     pub topics: HashMap<StreamId, Vec<TopicInfo>>,
     topics_loading: HashSet<StreamId>,
+    /// When fetching a channel's topics last failed: retried after [`TOPICS_RETRY`], not on
+    /// every render (the sidebar asks each time it draws the channel).
+    topics_failed: HashMap<StreamId, Instant>,
     /// Send times of messages we don't hold (a topic's newest, for "active" topics). Zero
     /// means unknown for good (deleted or inaccessible).
     message_times: HashMap<MessageId, i64>,
+    /// Message times being fetched, and when fetching them last failed.
+    times_inflight: HashSet<MessageId>,
+    times_failed: Option<Instant>,
     times_pending: HashSet<MessageId>,
     times_scheduled: bool,
     /// Conversations being paged back to reach a message (a search result), with the pages
     /// fetched so far.
     reveal: HashMap<Conv, (MessageId, u32)>,
+    /// When each conversation was last opened, for choosing what to let go (see `trim`).
+    opened: HashMap<Conv, Instant>,
     pub outbox: Vec<Pending>,
     next_local: u64,
     read_queue: BTreeSet<MessageId>,
@@ -123,10 +149,18 @@ pub struct Session {
     /// Our Zulip settings as the server last sent them (`user_settings` from register),
     /// updated in place when we change one.
     pub user_settings: serde_json::Value,
+    typing: Typing,
+    /// Clears typing that lapsed without a stop; armed for the next lapse.
+    typing_lapse: Option<Task<()>>,
+    /// Sends stop once we pause typing.
+    typing_idle: Option<Task<()>>,
+    /// Typing notifications to send, one request at a time so a stop can't overtake its start.
+    typing_out: Option<tokio::sync::mpsc::UnboundedSender<(Vec<UserId>, bool)>>,
     _sync: Task<()>,
 }
 
 impl EventEmitter<Rc<Updated>> for Session {}
+impl EventEmitter<TypingChanged> for Session {}
 
 impl Session {
     /// Opens the store, shows its cached model at once, and starts the event queue.
@@ -141,12 +175,19 @@ impl Session {
             }
         };
         tracing::info!("cached model loaded in {:.1?}", t.elapsed());
+        crate::bench::record("cached_model_ms", t.elapsed().as_secs_f64() * 1000.);
+        // Benchmark mode: the cache alone, no queue, no overlay, no server.
+        let offline = puzil_zulip::client::is_offline();
         let images = cx.new(|_| crate::media::Images::new(client.clone(), crate::accounts::data_dir().join("cache/media")));
-        let overlay = puzil_overlay::enabled_for(&account.realm)
+        let overlay = (puzil_overlay::enabled_for(&account.realm) && !offline)
             .then(|| cx.new(|cx| crate::overlay::Overlay::new(client.clone(), account.user_id, cx)));
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        crate::runtime::rt().spawn(queue::run(client.clone(), tx));
+        if offline {
+            drop(tx);
+        } else {
+            crate::runtime::rt().spawn(queue::run(client.clone(), tx));
+        }
         let sync = cx.spawn(async move |this, cx| {
             while let Some(first) = rx.recv().await {
                 // Coalesce whatever else is already queued into one model update.
@@ -159,6 +200,7 @@ impl Session {
                 }
             }
         });
+        let typing_out = (!offline).then(|| typing_sender(client.clone()));
         Self {
             account,
             client,
@@ -170,10 +212,14 @@ impl Session {
             conv_of_id: HashMap::new(),
             topics: HashMap::new(),
             topics_loading: HashSet::new(),
+            topics_failed: HashMap::new(),
             message_times: HashMap::new(),
+            times_inflight: HashSet::new(),
+            times_failed: None,
             times_pending: HashSet::new(),
             times_scheduled: false,
             reveal: HashMap::new(),
+            opened: HashMap::new(),
             outbox: Vec::new(),
             next_local: 1,
             read_queue: BTreeSet::new(),
@@ -183,7 +229,10 @@ impl Session {
             overlay,
             registered_once: false,
             user_settings: serde_json::Value::Null,
-            
+            typing: Typing::default(),
+            typing_lapse: None,
+            typing_idle: None,
+            typing_out,
             _sync: sync,
         }
     }
@@ -191,10 +240,16 @@ impl Session {
     fn apply_updates(&mut self, batch: Vec<Update>, cx: &mut Context<Self>) {
         let mut up = Updated::default();
         let mut moved_streams = HashSet::new();
+        // Whether anything shown could have changed: a batch of heartbeats (one a minute,
+        // idle or not) changes nothing and mustn't redraw.
+        let mut changed = false;
+        let mut typing = HashSet::new();
         for u in batch {
             match u {
                 Update::Registered { register, raw } => {
                     self.user_settings = raw.get("user_settings").cloned().unwrap_or_default();
+                    self.typing.set_periods(&raw);
+                    typing.extend(self.typing.clear());
                     let first = !self.registered_once;
                     self.registered_once = true;
                     let ch = self.state.reset_from_register(&register);
@@ -205,14 +260,24 @@ impl Session {
                         d.fresh = false;
                     }
                     self.topics.clear();
+                    // Topics that failed while we were cut off are asked for again now.
+                    self.topics_failed.clear();
                     if first {
                         self.load_emoji(cx);
                     }
                     up.all = true;
                     up.sidebar = true;
                     up.unreads = true;
+                    changed = true;
                 }
                 Update::Events { events, .. } => {
+                    // Events flowing again after a failed poll on the same queue: back to live.
+                    if matches!(self.status, Status::Retrying(_)) {
+                        self.status = Status::Live;
+                        self.topics_failed.clear();
+                        up.sidebar = true;
+                        changed = true;
+                    }
                     for e in &events {
                         if let Event::UpdateMessage(u) = e
                             && u.is_move()
@@ -220,6 +285,7 @@ impl Session {
                             moved_streams.extend(u.stream_id);
                             moved_streams.extend(u.new_stream_id);
                         }
+                        typing.extend(self.note_typing(e));
                     }
                     let ch = self.state.apply_all(&events);
                     self.store.write(puzil_store::writes_for(&self.state, &ch));
@@ -230,15 +296,19 @@ impl Session {
                     up.messages.extend(u.messages);
                     up.unreads |= u.unreads;
                     up.sidebar |= u.sidebar;
+                    let outbox = self.outbox.len();
                     self.outbox.retain(|p| p.sent_id.is_none_or(|id| !self.state.messages.contains_key(&id)));
+                    changed |= ch != Changes::default() || self.outbox.len() != outbox;
                 }
                 Update::Retrying { error, after } => {
                     self.status = Status::Retrying(format!("{error} (retrying in {:.0?})", after));
                     up.sidebar = true;
+                    changed = true;
                 }
                 Update::Unauthorized(m) => {
                     self.status = Status::SignedOut(m);
                     up.sidebar = true;
+                    changed = true;
                 }
             }
         }
@@ -247,8 +317,129 @@ impl Session {
                 self.load_topics(sid, cx);
             }
         }
+        if !typing.is_empty() {
+            for c in typing {
+                cx.emit(TypingChanged(c));
+            }
+            self.arm_typing_lapse(cx);
+        }
+        if !changed {
+            return;
+        }
+        // Live events grow the messages held too: a window left on one conversation in a busy
+        // organization would otherwise never let go of any.
+        if self.state.messages.len() > TRIM_AT {
+            let current = self.opened.iter().max_by_key(|(_, t)| **t).map(|(c, _)| c.clone());
+            self.trim(current.as_ref());
+        }
         cx.emit(Rc::new(up));
         cx.notify();
+    }
+
+    // ---- Typing ----
+
+    /// Updates who's typing for one event; returns the DM it changed.
+    fn note_typing(&mut self, e: &Event) -> Option<Conv> {
+        let now = Instant::now();
+        let me = self.state.me;
+        match e {
+            Event::Typing { start, sender, stream_id: None, recipients, .. }
+                if *sender != me && !self.state.muted_users.contains(sender) =>
+            {
+                let c = Conv::Dm(DmKey::new(me, recipients.iter().copied()));
+                self.typing.event(c.clone(), *sender, *start, now).then_some(c)
+            }
+            Event::Message { message, .. } if self.typing.anyone() => {
+                let c = conv_of(me, message);
+                self.typing.message_from(&c, message.sender_id, now).then_some(c)
+            }
+            _ => None,
+        }
+    }
+
+    /// Who is typing in `c` (a DM) besides us.
+    pub fn typing_in(&self, c: &Conv) -> Vec<UserId> {
+        self.typing.who(c, Instant::now())
+    }
+
+    fn arm_typing_lapse(&mut self, cx: &mut Context<Self>) {
+        let Some(at) = self.typing.next_lapse() else {
+            self.typing_lapse = None;
+            return;
+        };
+        self.typing_lapse = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(at.saturating_duration_since(Instant::now()) + Duration::from_millis(20)).await;
+            let _ = this.update(cx, |s, cx| {
+                for c in s.typing.prune(Instant::now()) {
+                    cx.emit(TypingChanged(c));
+                }
+                s.arm_typing_lapse(cx);
+            });
+        }));
+    }
+
+    /// The composer of `c` changed; tells the other side of a DM that we're typing (or
+    /// stopped), as the Zulip setting allows.
+    pub fn composing(&mut self, c: &Conv, empty: bool, cx: &mut Context<Self>) {
+        // Off until register says (the setting may be off); on for a server without it.
+        let allowed = self.user_settings.is_object()
+            && self.user_settings.get("send_private_typing_notifications").and_then(|v| v.as_bool()).unwrap_or(true);
+        // Channel typing isn't sent: we don't show it either. A DM with ourselves has no one to tell.
+        let to_others = matches!(c, Conv::Dm(k) if k.0.len() > 1);
+        let empty = empty || !allowed || !to_others;
+        let notices = self.typing.keystroke(c, empty, Instant::now());
+        for n in notices {
+            self.tell_typing(n, cx);
+        }
+        if empty {
+            self.typing_idle = None;
+        } else {
+            self.arm_typing_idle(cx);
+        }
+    }
+
+    /// We left the composer of `except` (or every composer): no longer typing there.
+    pub fn stop_composing(&mut self, except: Option<&Conv>, cx: &mut Context<Self>) {
+        if except.is_some_and(|c| self.typing.typing_to() == Some(c)) {
+            return;
+        }
+        if let Some(n) = self.typing.sent_message() {
+            self.tell_typing(n, cx);
+        }
+        self.typing_idle = None;
+    }
+
+    fn arm_typing_idle(&mut self, cx: &mut Context<Self>) {
+        let due = match self.typing.idle(Instant::now()) {
+            Ok(n) => {
+                self.typing_idle = None;
+                if let Some(n) = n {
+                    self.tell_typing(n, cx);
+                }
+                return;
+            }
+            Err(due) => due,
+        };
+        // Re-armed only when no timer is pending; one fires, then checks the latest keystroke.
+        if self.typing_idle.is_some() {
+            return;
+        }
+        self.typing_idle = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(due.saturating_duration_since(Instant::now())).await;
+            let _ = this.update(cx, |s, cx| {
+                s.typing_idle = None;
+                s.arm_typing_idle(cx);
+            });
+        }));
+    }
+
+    fn tell_typing(&self, n: Notice, _: &mut Context<Self>) {
+        let (c, start) = match n {
+            Notice::Start(c) => (c, true),
+            Notice::Stop(c) => (c, false),
+        };
+        let (Conv::Dm(k), Some(out)) = (c, &self.typing_out) else { return };
+        let _ = out.send((k.others(self.state.me).collect(), start));
     }
 
     /// Keeps `by_conv` in line with `state.messages` for the given ids.
@@ -304,30 +495,53 @@ impl Session {
 
     /// Shows the cached messages of `c` and validates them against the server.
     pub fn open(&mut self, c: &Conv, cx: &mut Context<Self>) {
+        self.opened.insert(c.clone(), Instant::now());
+        self.stop_composing(Some(c), cx);
+        self.trim(Some(c));
+        // Never opened (or let go by `trim`): its cached history may hold more than the live
+        // messages that arrived meanwhile.
+        let read_store = !self.convs.contains_key(c) || !self.by_conv.contains_key(c);
         let d = self.convs.entry(c.clone()).or_default();
         if d.fresh || d.loading {
             return;
         }
         d.loading = true;
-        let first_load = !self.by_conv.contains_key(c);
-        let store = self.store.clone();
+        // Cached messages: read on a background thread, but waited for up to a few ms, so a
+        // warm read (well under a millisecond) shows them in the frame that opens the
+        // conversation. A read from a cold disk cache (~10 ms) arrives a frame or two later
+        // instead of stalling the main thread. The server's first page is asked for after
+        // the cached messages are in, so they can't land on top of it.
+        let pending = if !read_store {
+            None
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (store, conv) = (self.store.clone(), c.clone());
+            cx.background_spawn(async move {
+                let _ = tx.send(store.messages(&conv, None, 200).unwrap_or_default());
+            })
+            .detach();
+            match rx.recv_timeout(Duration::from_millis(4)) {
+                Ok(cached) => {
+                    self.show_cached(c, cached, cx);
+                    None
+                }
+                Err(_) => Some(rx),
+            }
+        };
         let conv = c.clone();
         let has_unread = self.state.unread.values().any(|u| u == c);
         cx.spawn(async move |this, cx| {
-            if first_load {
-                let cached = cx.background_spawn({
-                    let conv = conv.clone();
-                    async move { store.messages(&conv, None, 200).unwrap_or_default() }
-                });
-                let cached = cached.await;
-                let _ = this.update(cx, |s, cx| {
-                    let fresh: Vec<_> = cached.into_iter().filter(|m| !s.state.messages.contains_key(&m.id)).collect();
-                    if !fresh.is_empty() {
-                        let ids = s.insert_messages(fresh);
-                        cx.emit(Rc::new(Updated { convs: [conv.clone()].into(), messages: ids, ..Default::default() }));
-                        cx.notify();
+            if let Some(rx) = pending {
+                let cached = cx.background_spawn(async move { rx.recv().unwrap_or_default() }).await;
+                let _ = this.update(cx, |s, cx| s.show_cached(&conv, cached, cx));
+            }
+            if puzil_zulip::client::is_offline() {
+                let _ = this.update(cx, |s, _| {
+                    if let Some(d) = s.convs.get_mut(&conv) {
+                        d.loading = false;
                     }
                 });
+                return;
             }
             let Ok((client, narrow)) = this.read_with(cx, |s, _| (s.client.clone(), s.narrow(&conv))) else { return };
             let anchor = if has_unread { Anchor::FirstUnread } else { Anchor::Newest };
@@ -335,6 +549,45 @@ impl Session {
             let _ = this.update(cx, |s, cx| s.absorb_page(&conv, page, false, cx));
         })
         .detach();
+    }
+
+    /// Lets go of messages held in memory once there are more than [`TRIM_AT`]: whole
+    /// conversations, those never opened (live events) or opened longest ago first, down to
+    /// [`TRIM_TO`]. They stay in the store; opening one again reads it back and re-validates
+    /// it with the server, as after a launch. Without this a session left running for days in a
+    /// busy organization keeps every message it ever saw.
+    fn trim(&mut self, keep: Option<&Conv>) {
+        if self.state.messages.len() <= TRIM_AT {
+            return;
+        }
+        let mut convs: Vec<(Option<Instant>, Conv)> = self
+            .by_conv
+            .keys()
+            .filter(|c| Some(*c) != keep)
+            .filter(|c| !self.convs.get(*c).is_some_and(|d| d.loading || d.loading_older))
+            .map(|c| (self.opened.get(c).copied(), c.clone()))
+            .collect();
+        convs.sort_by_key(|(t, _)| *t);
+        for (_, c) in convs {
+            if self.state.messages.len() <= TRIM_TO {
+                break;
+            }
+            for id in self.by_conv.remove(&c).unwrap_or_default() {
+                self.state.messages.remove(&id);
+                self.conv_of_id.remove(&id);
+            }
+            self.convs.remove(&c);
+            self.reveal.remove(&c);
+        }
+    }
+
+    fn show_cached(&mut self, c: &Conv, cached: Vec<Message>, cx: &mut Context<Self>) {
+        let fresh: Vec<_> = cached.into_iter().filter(|m| !self.state.messages.contains_key(&m.id)).collect();
+        if !fresh.is_empty() {
+            let ids = self.insert_messages(fresh);
+            cx.emit(Rc::new(Updated { convs: [c.clone()].into(), messages: ids, ..Default::default() }));
+            cx.notify();
+        }
     }
 
     /// Pages `c` back until `id` is held (or the start is reached, or 30 pages: 3000
@@ -423,12 +676,19 @@ impl Session {
         // (Ids we marked read locally and haven't sent yet stay read.)
         for m in &page.messages {
             if m.has_flag("read") {
-                self.state.unread.remove(&m.id);
+                if self.state.unread.remove(&m.id).is_some() {
+                    ch.unreads = true;
+                    ch.unread_ids.insert(m.id);
+                }
                 self.state.mentions.remove(&m.id);
             } else if !self.read_queue.contains(&m.id) {
-                self.state.unread.insert(m.id, conv_of(self.state.me, m));
-                if m.is_mention() {
-                    self.state.mentions.insert(m.id);
+                if self.state.unread.insert(m.id, conv_of(self.state.me, m)).is_none() {
+                    ch.unreads = true;
+                    ch.unread_ids.insert(m.id);
+                }
+                if m.is_mention() && self.state.mentions.insert(m.id) {
+                    ch.unreads = true;
+                    ch.unread_ids.insert(m.id);
                 }
             }
         }
@@ -477,6 +737,11 @@ impl Session {
         if id == 0 {
             return None;
         }
+        // Not while it's being asked for, nor right after a request failed (offline, rate
+        // limited): the sidebar asks on every redraw.
+        if self.times_inflight.contains(&id) || self.times_failed.is_some_and(|t| t.elapsed() < TIMES_RETRY) {
+            return None;
+        }
         if self.times_pending.insert(id) && !self.times_scheduled {
             self.times_scheduled = true;
             let client = self.client.clone();
@@ -484,7 +749,9 @@ impl Session {
                 cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
                 let Ok(ids) = this.update(cx, |this, _| {
                     this.times_scheduled = false;
-                    this.times_pending.drain().collect::<Vec<_>>()
+                    let ids = this.times_pending.drain().collect::<Vec<_>>();
+                    this.times_inflight.extend(ids.iter().copied());
+                    ids
                 }) else {
                     return;
                 };
@@ -498,13 +765,27 @@ impl Session {
                 })
                 .await;
                 let _ = this.update(cx, |this, cx| {
-                    match r {
-                        Ok(v) => this.message_times.extend(v),
-                        Err(e) => tracing::warn!("message times: {e}"),
+                    for id in &asked {
+                        this.times_inflight.remove(id);
                     }
-                    // Whatever didn't come back won't on a retry either.
-                    for id in asked {
-                        this.message_times.entry(id).or_insert(0);
+                    match r {
+                        Ok(v) => {
+                            this.message_times.extend(v);
+                            // Whatever didn't come back (deleted) won't on a retry either.
+                            for id in asked {
+                                this.message_times.entry(id).or_insert(0);
+                            }
+                        }
+                        Err(e) => {
+                            // Asked again after a while, with a redraw to do the asking.
+                            tracing::warn!("message times: {e}");
+                            this.times_failed = Some(Instant::now());
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(TIMES_RETRY + Duration::from_millis(250)).await;
+                                let _ = this.update(cx, |_, cx| cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() })));
+                            })
+                            .detach();
+                        }
                     }
                     cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() }));
                 });
@@ -538,8 +819,16 @@ impl Session {
         );
     }
 
+    /// Whether the last try to load `sid`'s topics failed (it's retried after a while).
+    pub fn topics_failed(&self, sid: StreamId) -> bool {
+        self.topics_failed.contains_key(&sid)
+    }
+
     pub fn load_topics(&mut self, sid: StreamId, cx: &mut Context<Self>) {
-        if self.topics.contains_key(&sid) || !self.topics_loading.insert(sid) {
+        if self.topics.contains_key(&sid) || self.topics_failed.get(&sid).is_some_and(|t| t.elapsed() < TOPICS_RETRY) {
+            return;
+        }
+        if !self.topics_loading.insert(sid) {
             return;
         }
         let client = self.client.clone();
@@ -549,12 +838,24 @@ impl Session {
                 s.topics_loading.remove(&sid);
                 match r {
                     Ok(t) => {
+                        s.topics_failed.remove(&sid);
                         s.topics.insert(sid, t);
+                        cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() }));
+                        cx.notify();
                     }
-                    Err(e) => tracing::warn!("topics for {sid}: {e}"),
+                    Err(e) => {
+                        tracing::warn!("topics for {sid}: {e}");
+                        s.topics_failed.insert(sid, Instant::now());
+                        // Show the failure, and redraw when a retry is due: the sidebar asks
+                        // again as it draws (and only then, being drawn from cache otherwise).
+                        cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() }));
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(TOPICS_RETRY + Duration::from_millis(250)).await;
+                            let _ = this.update(cx, |_, cx| cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() })));
+                        })
+                        .detach();
+                    }
                 }
-                cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() }));
-                cx.notify();
             });
         })
         .detach();
@@ -570,13 +871,17 @@ impl Session {
                 self.state.mentions.remove(&id);
                 ch.convs.insert(c);
                 ch.unreads = true;
+                ch.unread_ids.insert(id);
                 self.read_queue.insert(id);
             }
         }
         if !ch.unreads {
             return;
         }
-        self.store.write(puzil_store::writes_for(&self.state, &Changes { unreads: true, ..Default::default() }));
+        self.store.write(puzil_store::writes_for(
+            &self.state,
+            &Changes { unreads: true, unread_ids: std::mem::take(&mut ch.unread_ids), ..Default::default() },
+        ));
         cx.emit(Rc::new(Updated { convs: ch.convs, unreads: true, sidebar: true, ..Default::default() }));
         cx.notify();
         if self.read_flush.is_none() {
@@ -632,6 +937,7 @@ impl Session {
         self.next_local += 1;
         self.outbox.push(Pending { local_id, conv: conv.clone(), topic, content, state: PendingState::Sending, sent_id: None });
         self.store.write(vec![puzil_store::Write::Draft { conv: conv.clone(), body: String::new() }]);
+        self.stop_composing(None, cx);
         self.dispatch(local_id, cx);
         cx.emit(Rc::new(Updated { convs: [conv].into(), ..Default::default() }));
         cx.notify();
@@ -723,4 +1029,28 @@ impl Session {
         })
         .detach();
     }
+}
+
+/// Sends typing notifications in order on the network runtime. A start still queued when
+/// its stop arrives is dropped with it: the other side never needs to see either.
+fn typing_sender(client: Client) -> tokio::sync::mpsc::UnboundedSender<(Vec<UserId>, bool)> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<UserId>, bool)>();
+    crate::runtime::rt().spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut batch = vec![first];
+            while let Ok(n) = rx.try_recv() {
+                if !n.1 && batch.last().is_some_and(|(to, start)| *start && *to == n.0) {
+                    batch.pop();
+                } else {
+                    batch.push(n);
+                }
+            }
+            for (to, start) in batch {
+                if let Err(e) = client.set_typing(&to, start).await {
+                    tracing::debug!("typing notification failed: {e}");
+                }
+            }
+        }
+    });
+    tx
 }

@@ -10,9 +10,9 @@ BIN="$PREFIX/bin/puzil"
 APPS="$PREFIX/share/applications"
 ICONS="$PREFIX/share/icons/hicolor/512x512/apps"
 
-cargo build --release -p puzil-app
+cargo build --profile dist -p puzil-app
 
-install -Dm755 target/release/puzil-app "$BIN"
+install -Dm755 target/dist/puzil-app "$BIN"
 install -Dm644 assets/icon/puzil-512.png "$ICONS/com.satchlj.puzil.png"
 mkdir -p "$APPS"
 sed "s|@BIN@|$BIN|" tools/linux/com.satchlj.puzil.desktop.in > "$APPS/com.satchlj.puzil.desktop"

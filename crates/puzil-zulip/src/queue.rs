@@ -26,6 +26,8 @@ pub const EVENT_TYPES: &[&str] = &[
     "user_topic",
     "muted_users",
     "realm_emoji",
+    // DM typing only: without the `stream_typing_notifications` capability the server
+    // leaves out channel typing, which would wake the app for every keystroke anywhere.
     "typing",
     "channel_folder",
 ];
@@ -50,7 +52,6 @@ pub async fn register(client: &Client) -> Result<(Register, Value), ApiError> {
         "notification_settings_null": true,
         "bulk_message_deletion": true,
         "user_avatar_url_field_optional": true,
-        "stream_typing_notifications": true,
         "user_settings_object": true,
         "empty_topic_name": true,
         "archived_channels": true,
@@ -144,6 +145,9 @@ pub async fn run(client: Client, tx: mpsc::UnboundedSender<Update>) {
         if tx.send(Update::Registered { register: Box::new(reg), raw }).is_err() {
             return;
         }
+        // Whether the last poll failed: the first one to succeed afterwards is passed on even if
+        // it held only heartbeats, so the consumer knows the connection is back.
+        let mut recovering = false;
         loop {
             match get_events(&client, &queue_id, last, longpoll).await {
                 Ok(raw) => {
@@ -152,9 +156,10 @@ pub async fn run(client: Client, tx: mpsc::UnboundedSender<Update>) {
                         last = last.max(max);
                     }
                     let raw: Vec<Value> = raw.into_iter().filter(|e| e["type"] != "heartbeat").collect();
-                    if raw.is_empty() {
+                    if raw.is_empty() && !std::mem::take(&mut recovering) {
                         continue;
                     }
+                    recovering = false;
                     let events = parse_batch(&raw);
                     if tx.send(Update::Events { events, raw }).is_err() {
                         return;
@@ -176,6 +181,7 @@ pub async fn run(client: Client, tx: mpsc::UnboundedSender<Update>) {
                     if tx.send(Update::Retrying { error: e.to_string(), after }).is_err() {
                         return;
                     }
+                    recovering = true;
                     tokio::time::sleep(after).await;
                 }
             }

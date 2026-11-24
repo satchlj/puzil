@@ -85,7 +85,14 @@ impl Sort {
     }
 }
 
+/// Unread counts per conversation and per channel.
+type Counts = (HashMap<Conv, Count>, HashMap<StreamId, Count>);
+
 pub struct Sidebar {
+    /// The unread counts, kept until the session next changes: counting walks every unread
+    /// message (tens of thousands with a Zulip backlog), and the sidebar also redraws for
+    /// hovers and images.
+    counts: Option<Rc<Counts>>,
     pub(super) session: Entity<Session>,
     sort: Sort,
     pub(super) theme: Rc<Theme>,
@@ -132,6 +139,14 @@ struct Node {
 }
 
 impl Sidebar {
+    /// The sidebar's width while it can be drawn from the previous frame's copy (see
+    /// [`super::workspace`]): `None` while the rail slides in or out, which animates
+    /// every frame.
+    pub fn cached_width(&self) -> Option<f32> {
+        let sliding = self.rail_toggled.is_some_and(|t| t.elapsed().as_millis() < 260);
+        (!sliding).then_some(if self.rail_open { 72. + SIDEBAR_W } else { SIDEBAR_W })
+    }
+
     pub fn new(session: Entity<Session>, theme: Rc<Theme>, cx: &mut Context<Self>) -> Self {
         let sub = cx.subscribe(&session, |_, _, up: &Rc<Updated>, cx| {
             if up.sidebar {
@@ -141,6 +156,7 @@ impl Sidebar {
         let images = session.read(cx).images.clone();
         let mut subs = vec![
             sub,
+            cx.observe(&session, |this: &mut Self, _, _| this.counts = None),
             cx.observe(&images, |_, _, cx| cx.notify()),
             cx.observe(&crate::settings::handle(cx), |_, _, cx| cx.notify()),
             cx.observe(&crate::servers::handle(cx), |_, _, cx| cx.notify()),
@@ -154,6 +170,7 @@ impl Sidebar {
             session.update(cx, |s, cx| s.load_topics(*sid, cx));
         }
         Self {
+            counts: None,
             session,
             sort: Sort::Recent,
             theme,
@@ -257,7 +274,7 @@ impl Sidebar {
         cx.notify();
     }
 
-    fn counts(s: &Session) -> (HashMap<Conv, Count>, HashMap<StreamId, Count>) {
+    fn counts(s: &Session) -> Counts {
         let mut conv: HashMap<Conv, Count> = HashMap::new();
         let mut stream: HashMap<StreamId, Count> = HashMap::new();
         for (id, c) in &s.state.unread {
@@ -291,24 +308,24 @@ impl Sidebar {
         }
         let now = chrono::Utc::now().timestamp();
         let mut out = HashMap::new();
-        overlay.update(cx, |o, cx| {
-            for (key, name, max_id) in topics {
-                let score = o
-                    .topic_anchor(&key, &name, cx)
-                    .and_then(|a| o.topic_scores.get(&a.id).copied())
-                    .map(|s| s.score)
-                    .unwrap_or(0);
-                let v = match self.sort {
-                    Sort::Top => score as f64,
-                    Sort::Bottom => -(score as f64),
-                    _ => {
-                        let hours = o.message_time(max_id, cx).map(|t| (now - t) as f64 / 3600.).unwrap_or(24. * 30.);
-                        puzil_overlay::hot(score, hours)
-                    }
-                };
-                out.insert(key, v);
-            }
-        });
+        let session = self.session.clone();
+        for (key, name, max_id) in topics {
+            let score = overlay.update(cx, |o, cx| {
+                o.topic_anchor(&key, &name, cx).and_then(|a| o.topic_scores.get(&a.id).copied()).map(|s| s.score).unwrap_or(0)
+            });
+            let v = match self.sort {
+                Sort::Top => score as f64,
+                Sort::Bottom => -(score as f64),
+                _ => {
+                    let hours = session
+                        .update(cx, |s, cx| s.message_time(max_id, cx))
+                        .map(|t| (now - t) as f64 / 3600.)
+                        .unwrap_or(24. * 30.);
+                    puzil_overlay::hot(score, hours)
+                }
+            };
+            out.insert(key, v);
+        }
         Some(out)
     }
 
@@ -767,9 +784,10 @@ impl Render for Sidebar {
             group: bool,
             avatar: Option<String>,
         }
+        let all_counts = self.counts.get_or_insert_with(|| Rc::new(Self::counts(session.read(cx)))).clone();
         let (dm_rows, me_name, me_id, me_avatar, _realm_icon) = {
             let s = session.read(cx);
-            let (counts, _) = Self::counts(s);
+            let counts = &all_counts.0;
             let mut dms: Vec<(DmKey, MessageId)> = s.state.recent_dms.iter().map(|(k, v)| (k.clone(), *v)).collect();
             for c in counts.keys() {
                 if let Conv::Dm(k) = c
@@ -809,7 +827,7 @@ impl Render for Sidebar {
             .collect();
 
         let s = session.read(cx);
-        let (counts, stream_counts) = Self::counts(s);
+        let (counts, stream_counts) = (&all_counts.0, &all_counts.1);
         let mut total = Count::default();
         counts.values().for_each(|c| total.add(*c));
 
@@ -1084,7 +1102,7 @@ impl Render for Sidebar {
                                 .h(px(26.))
                                 .text_size(px(12.))
                                 .text_color(t.faint)
-                                .child("Loading topics…")
+                                .child(if s.topics_failed(sid) { "Couldn't load topics" } else { "Loading topics…" })
                                 .into_any_element(),
                         );
                     }

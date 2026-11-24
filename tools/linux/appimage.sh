@@ -10,7 +10,7 @@ VERSION=$(awk -F\" '/^version/ {print $2; exit}' Cargo.toml)
 ARCH=$(uname -m)
 OUT="dist/Puzil-$VERSION-$ARCH.AppImage"
 
-cargo build --release -p puzil-app
+cargo build --profile dist -p puzil-app
 
 TOOLS=dist/appimage-tools
 LD="$TOOLS/linuxdeploy-$ARCH.AppImage"
@@ -23,7 +23,7 @@ fi
 STAGE=dist/appimage-stage
 rm -rf dist/AppDir "$STAGE" "$OUT"
 mkdir -p "$STAGE"
-cp target/release/puzil-app "$STAGE/puzil"
+cp target/dist/puzil-app "$STAGE/puzil"
 sed "s|@BIN@|puzil|" tools/linux/com.satchlj.puzil.desktop.in > "$STAGE/com.satchlj.puzil.desktop"
 cp assets/icon/puzil-512.png "$STAGE/com.satchlj.puzil.png"
 

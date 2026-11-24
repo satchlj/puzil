@@ -157,7 +157,12 @@ impl Composer {
                 self.error = None;
                 self.update_completion(cx);
                 if let (Mode::New, Target::Conv(c)) = (&self.mode, &self.target) {
-                    self.session.read(cx).save_draft(c, self.text(cx));
+                    let text = self.text(cx);
+                    let empty = text.trim().is_empty();
+                    self.session.update(cx, |s, cx| {
+                        s.save_draft(c, text);
+                        s.composing(c, empty, cx);
+                    });
                 }
                 cx.notify();
             }
@@ -430,6 +435,7 @@ impl Composer {
     }
 
     pub fn start_edit(&mut self, id: MessageId, window: &mut Window, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, cx| s.stop_composing(None, cx));
         self.mode = Mode::Edit { id, loading: true };
         self.completion = None;
         self.set_text("", window, cx);

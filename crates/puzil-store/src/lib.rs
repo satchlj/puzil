@@ -12,7 +12,7 @@ use std::{
     path::Path,
     sync::{Mutex, mpsc},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -23,7 +23,7 @@ use puzil_zulip::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = include_str!("schema.sql");
 
 // ---- Conversation keys as text ----
@@ -93,6 +93,9 @@ pub enum Write {
     RealmEmoji(Vec<RealmEmoji>),
     /// Replaces the whole unread set: `(id, conv, mentioned)`.
     Unreads(Vec<(MessageId, Conv, bool)>),
+    UpsertUsers(Vec<User>),
+    /// Unread rows to set (id, conversation, mentioned) and ids no longer unread.
+    UnreadDelta { set: Vec<(MessageId, Conv, bool)>, clear: Vec<MessageId> },
     Topics(Vec<(TopicKey, String)>),
     UpsertMessages(Vec<(Message, Conv)>),
     DeleteMessages(Vec<MessageId>),
@@ -110,9 +113,17 @@ enum Cmd {
 /// Writes that bring the store in line with `state` after `changes`.
 pub fn writes_for(state: &State, changes: &Changes) -> Vec<Write> {
     let mut w = vec![];
-    if changes.all || changes.users {
+    if changes.all || (changes.users && changes.user_ids.is_empty() && !changes.muted_users) {
         w.push(Write::Users(state.users.values().cloned().collect()));
         w.push(Write::MutedUsers(state.muted_users.iter().copied().collect()));
+    } else {
+        // A profile edit or a signup writes that user, not the whole (often large) table.
+        if !changes.user_ids.is_empty() {
+            w.push(Write::UpsertUsers(changes.user_ids.iter().filter_map(|id| state.users.get(id)).cloned().collect()));
+        }
+        if changes.muted_users {
+            w.push(Write::MutedUsers(state.muted_users.iter().copied().collect()));
+        }
     }
     if changes.all || changes.streams {
         w.push(Write::Streams { streams: state.streams.values().cloned().collect(), subs: state.subs.values().cloned().collect() });
@@ -132,8 +143,19 @@ pub fn writes_for(state: &State, changes: &Changes) -> Vec<Write> {
         let v: Vec<_> = state.recent_dms.iter().map(|(k, id)| (k.0.clone(), *id)).collect();
         w.push(Write::Meta { key: "recent_dms".into(), value: serde_json::to_string(&v).unwrap_or_default() });
     }
-    if changes.all || changes.unreads {
+    if changes.all || changes.unreads_all || (changes.unreads && changes.unread_ids.is_empty()) {
         w.push(Write::Unreads(state.unread.iter().map(|(id, c)| (*id, c.clone(), state.mentions.contains(id))).collect()));
+    } else if !changes.unread_ids.is_empty() {
+        // Just the rows that changed: with a large backlog a full rewrite clones tens of
+        // thousands of entries on the main thread and rewrites the table on every read.
+        let (mut set, mut clear) = (vec![], vec![]);
+        for id in &changes.unread_ids {
+            match state.unread.get(id) {
+                Some(c) => set.push((*id, c.clone(), state.mentions.contains(id))),
+                None => clear.push(*id),
+            }
+        }
+        w.push(Write::UnreadDelta { set, clear });
     }
     let topics: Vec<_> = changes
         .convs
@@ -180,7 +202,11 @@ fn configure(c: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate(c: &mut Connection) -> Result<()> {
+/// Brings the schema up to date. Returns whether the search table still needs rebuilding
+/// (version 1 to 2), which the writer thread does after opening, not here: `open` runs before
+/// the first frame, and rebuilding takes seconds on a large cache. Until then searches use the
+/// old table, which answers the same queries, just without the prefix indexes.
+fn migrate(c: &mut Connection) -> Result<bool> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
     match v {
@@ -189,10 +215,27 @@ fn migrate(c: &mut Connection) -> Result<()> {
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
+            Ok(false)
         }
-        SCHEMA_VERSION => {}
+        1 => Ok(true),
+        SCHEMA_VERSION => Ok(false),
         v => anyhow::bail!("store schema version {v} is newer than this build ({SCHEMA_VERSION})"),
     }
+}
+
+/// Version 2: prefix indexes on the search table, rebuilt from the messages.
+fn rebuild_search(c: &mut Connection) -> Result<()> {
+    let t = Instant::now();
+    let tx = c.transaction()?;
+    tx.execute_batch(
+        "DROP TABLE messages_fts;
+         CREATE VIRTUAL TABLE messages_fts USING fts5(text, topic, content='messages', content_rowid='id',
+             tokenize='unicode61 remove_diacritics 2', prefix='1 2');
+         INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');",
+    )?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    tracing::info!("search index rebuilt in {:.0?}", t.elapsed());
     Ok(())
 }
 
@@ -203,11 +246,16 @@ impl Store {
         }
         let mut wc = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         configure(&wc)?;
-        migrate(&mut wc)?;
+        let rebuild = migrate(&mut wc)?;
         let rc = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         configure(&rc)?;
         let (tx, rx) = mpsc::channel();
-        let writer = std::thread::Builder::new().name("puzil-store-writer".into()).spawn(move || writer_loop(wc, rx))?;
+        let writer = std::thread::Builder::new().name("puzil-store-writer".into()).spawn(move || {
+            if rebuild && let Err(e) = rebuild_search(&mut wc) {
+                tracing::error!("rebuilding the search index: {e:#}");
+            }
+            writer_loop(wc, rx)
+        })?;
         Ok(Self { tx, read: Mutex::new(rc), writer: Some(writer) })
     }
 
@@ -344,7 +392,10 @@ impl Store {
             if conv_prefix.is_some() {
                 sql.push_str(" AND substr(m.conv, 1, length(:conv)) = :conv");
             }
-            sql.push_str(" ORDER BY m.id DESC LIMIT :limit");
+            // Ordering by the search table's own rowid (the message id) lets SQLite walk the
+            // matches newest first and stop at the limit. Ordering by `m.id` sorts every match
+            // first, with a snippet built for each: 50 ms for "the" instead of 0.6.
+            sql.push_str(if words.is_empty() { " ORDER BY m.id DESC LIMIT :limit" } else { " ORDER BY messages_fts.rowid DESC LIMIT :limit" });
             let mut q = c.prepare(&sql)?;
             let mut args: Vec<(&str, &dyn rusqlite::ToSql)> = vec![];
             let limit = limit as i64;
@@ -370,6 +421,19 @@ impl Store {
     pub fn draft(&self, conv: &Conv) -> Result<Option<String>> {
         let key = conv_to_str(conv);
         self.with_read(|c| c.query_row("SELECT body FROM drafts WHERE conv = ?1", [key], |r| r.get(0)).optional())
+    }
+
+    /// The `n` conversations with the most cached messages, with their counts (for benchmarks).
+    pub fn busiest_convs(&self, n: usize) -> Result<Vec<(Conv, u64)>> {
+        self.with_read(|c| {
+            let mut q = c.prepare("SELECT conv, count(*) AS k FROM messages GROUP BY conv ORDER BY k DESC LIMIT ?1")?;
+            let v = q
+                .query_map(params![n as i64], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .filter_map(|r| r.ok())
+                .filter_map(|(k, n)| conv_from_str(&k).map(|c| (c, n as u64)))
+                .collect();
+            Ok(v)
+        })
     }
 
     pub fn message_count(&self) -> Result<u64> {
@@ -419,6 +483,12 @@ fn apply(c: &mut Connection, batch: &[Write]) -> Result<()> {
     let tx = c.transaction()?;
     for w in batch {
         match w {
+            Write::UpsertUsers(us) => {
+                let mut q = tx.prepare_cached("INSERT OR REPLACE INTO users (id, json) VALUES (?1, ?2)")?;
+                for u in us {
+                    q.execute(params![u.user_id as i64, serde_json::to_string(u)?])?;
+                }
+            }
             Write::Users(us) => {
                 tx.execute("DELETE FROM users", [])?;
                 let mut q = tx.prepare_cached("INSERT INTO users (id, json) VALUES (?1, ?2)")?;
@@ -459,6 +529,16 @@ fn apply(c: &mut Connection, batch: &[Write]) -> Result<()> {
                     q.execute(params![e.id, serde_json::to_string(e)?])?;
                 }
             }
+            Write::UnreadDelta { set, clear } => {
+                let mut q = tx.prepare_cached("INSERT OR REPLACE INTO unread_ids (id, conv, mention) VALUES (?1, ?2, ?3)")?;
+                for (id, conv, m) in set {
+                    q.execute(params![*id as i64, conv_to_str(conv), *m])?;
+                }
+                let mut d = tx.prepare_cached("DELETE FROM unread_ids WHERE id = ?1")?;
+                for id in clear {
+                    d.execute(params![*id as i64])?;
+                }
+            }
             Write::Unreads(us) => {
                 tx.execute("DELETE FROM unread_ids", [])?;
                 let mut q = tx.prepare_cached("INSERT INTO unread_ids (id, conv, mention) VALUES (?1, ?2, ?3)")?;
@@ -476,9 +556,12 @@ fn apply(c: &mut Connection, batch: &[Write]) -> Result<()> {
                 }
             }
             Write::UpsertMessages(ms) => {
+                // An unchanged message (a page re-validating the cache) writes nothing: no
+                // row rewrite, no search reindex through the update trigger.
                 let mut q = tx.prepare_cached(
                     "INSERT INTO messages (id, conv, sender_id, ts, topic, text, json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT (id) DO UPDATE SET conv = excluded.conv, topic = excluded.topic, text = excluded.text, json = excluded.json",
+                     ON CONFLICT (id) DO UPDATE SET conv = excluded.conv, topic = excluded.topic, text = excluded.text, json = excluded.json
+                     WHERE messages.json IS NOT excluded.json",
                 )?;
                 let mut t = tx.prepare_cached(
                     "INSERT INTO topics (stream_id, topic_lc, display, max_id) VALUES (?1, ?2, ?3, ?4)

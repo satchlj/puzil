@@ -11,7 +11,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "form", "query", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "form", "query", "multipart", "http2"] }
 url = "2.5"
 getrandom = "0.4"
 keyring-core = "1.1"

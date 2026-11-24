@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "auth-spike"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -2827,8 +2827,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-apple"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a460605ec4e8cbcc9b213462a84b1d6cc3efe4ed8f0e18669659f07b2d5c6aec"
 dependencies = [
  "anyhow",
  "async-task",
@@ -2974,8 +2972,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-macos"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2de7d3f4ad51ac387e822495db363fcc1188d349793365731d054444c4cb06ee"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4679,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "math-bakeoff"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6141,7 +6137,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-app"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6169,16 +6165,18 @@ dependencies = [
 
 [[package]]
 name = "puzil-avatar"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "image",
 ]
 
 [[package]]
 name = "puzil-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
+ "puzil-math",
+ "puzil-render",
  "puzil-store",
  "puzil-zulip",
  "serde_json",
@@ -6188,7 +6186,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-math"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "mitex",
@@ -6204,7 +6202,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-overlay"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "puzil-zulip",
  "reqwest",
@@ -6216,7 +6214,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-render"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ego-tree",
  "scraper",
@@ -6225,7 +6223,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-store"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "puzil-zulip",
@@ -6237,7 +6235,7 @@ dependencies = [
 
 [[package]]
 name = "puzil-zulip"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6707,6 +6705,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -6782,7 +6781,7 @@ dependencies = [
 
 [[package]]
 name = "richtext-list"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "gpui-kit",

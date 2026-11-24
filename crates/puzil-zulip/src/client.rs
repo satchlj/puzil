@@ -51,6 +51,23 @@ impl std::fmt::Debug for Client {
     }
 }
 
+/// Set once for benchmarks: every request fails before it leaves the machine, so nothing a
+/// run does (or a bug in it) can reach a server.
+static OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the network off for the rest of the process; it can't be turned back on.
+pub fn set_offline() {
+    OFFLINE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn is_offline() -> bool {
+    OFFLINE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn offline_error() -> ApiError {
+    ApiError::Api { status: 0, code: "OFFLINE".into(), msg: "the network is off (benchmark mode)".into() }
+}
+
 /// Default per-request timeout. Long polls override it.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -70,6 +87,9 @@ impl Client {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, timeout: Duration) -> ApiResult<Value> {
+        if is_offline() {
+            return Err(offline_error());
+        }
         let resp = req.basic_auth(&self.creds.email, Some(&self.creds.api_key)).timeout(timeout).send().await?;
         let status = resp.status();
         let retry_after = resp
@@ -207,6 +227,12 @@ impl Client {
         v["id"].as_u64().ok_or_else(|| ApiError::Decode("send: no id".into()))
     }
 
+    /// Tells the recipients of a DM that we started or stopped typing to them.
+    pub async fn set_typing(&self, to: &[u64], start: bool) -> ApiResult<()> {
+        let op = if start { "start" } else { "stop" };
+        self.post_value("typing", &[("type", "direct".into()), ("op", op.into()), ("to", json(to))]).await.map(drop)
+    }
+
     pub async fn edit_message(&self, id: u64, content: &str) -> ApiResult<()> {
         self.send_method(reqwest::Method::PATCH, &format!("messages/{id}"), &[("content", content.to_string())]).await.map(drop)
     }
@@ -246,6 +272,9 @@ impl Client {
 
     /// An unauthenticated GET of a public JSON document (such as the emoji data).
     pub async fn public_json(&self, url: &str) -> ApiResult<Value> {
+        if is_offline() {
+            return Err(offline_error());
+        }
         let r = self.http.get(url).timeout(TIMEOUT).send().await?;
         let b = r.bytes().await?;
         serde_json::from_slice(&b).map_err(|e| ApiError::Decode(e.to_string()))
@@ -392,6 +421,9 @@ impl Client {
     /// Downloads a file. Realm URLs (uploads, thumbnails, the image proxy) are fetched with
     /// our credentials; other hosts get no credentials.
     pub async fn get_bytes(&self, url: &str) -> ApiResult<Vec<u8>> {
+        if is_offline() {
+            return Err(offline_error());
+        }
         let abs = self.absolute(url);
         let mut req = self.http.get(&abs).timeout(Duration::from_secs(120));
         if abs.starts_with(&format!("{}/", self.creds.realm)) {

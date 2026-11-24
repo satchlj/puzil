@@ -16,3 +16,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 puzil-zulip = { path = "../puzil-zulip" }
 puzil-store = { path = "../puzil-store" }
+puzil-render = { path = "../puzil-render" }
+puzil-math = { path = "../puzil-math" }

@@ -53,13 +53,22 @@ pub enum Conv {
 }
 
 /// What an [`State::apply`] call touched, so views can refresh selectively.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Changes {
     pub convs: HashSet<Conv>,
     pub messages: HashSet<MessageId>,
     pub unreads: bool,
+    /// The messages whose unread or mention state changed, so the store can update just
+    /// those rows. Empty with `unreads` set (or with `unreads_all`) means rewrite them all.
+    pub unread_ids: HashSet<MessageId>,
+    /// Unread state changed wholesale (everything marked read).
+    pub unreads_all: bool,
     pub streams: bool,
     pub users: bool,
+    /// The users that changed (realm_user events), so the store can write just those.
+    pub user_ids: HashSet<UserId>,
+    /// The muted-users list changed.
+    pub muted_users: bool,
     pub user_topics: bool,
     /// Everything may have changed (re-register).
     pub all: bool,
@@ -226,6 +235,7 @@ impl State {
         if let Some(c) = self.unread.remove(&id) {
             ch.convs.insert(c);
             ch.unreads = true;
+            ch.unread_ids.insert(id);
         }
         self.mentions.remove(&id);
     }
@@ -252,6 +262,7 @@ impl State {
                         self.mentions.insert(m.id);
                     }
                     ch.unreads = true;
+                    ch.unread_ids.insert(m.id);
                 }
                 ch.convs.insert(conv);
                 ch.messages.insert(m.id);
@@ -293,6 +304,7 @@ impl State {
                         ch.convs.extend(self.unread.drain().map(|(_, c)| c));
                         self.mentions.clear();
                         ch.unreads = true;
+                        ch.unreads_all = true;
                     }
                     ("read", true) => {
                         for id in &f.messages {
@@ -323,6 +335,7 @@ impl State {
                             self.unread.insert(*id, conv.clone());
                             ch.convs.insert(conv);
                             ch.unreads = true;
+                            ch.unread_ids.insert(*id);
                         }
                     }
                     _ => {}
@@ -340,7 +353,9 @@ impl State {
                 }
             }
             Event::Subscription(s) => {
-                ch.streams = true;
+                // peer_add / peer_remove (someone else joined or left) are the common ones, and
+                // nothing modeled changes: no rewrite of the streams tables, no redraw.
+                ch.streams = !matches!(s, SubscriptionEvent::Other(_));
                 match s {
                     SubscriptionEvent::Add(pairs) => {
                         for (st, sub) in pairs {
@@ -419,17 +434,22 @@ impl State {
                 }
             }
             Event::RealmUser(u) => {
-                ch.users = true;
+                ch.users = !matches!(u, RealmUserEvent::Other(_));
                 match u {
                     RealmUserEvent::Add(u) => {
                         self.users.insert(u.user_id, u.clone());
+                        ch.user_ids.insert(u.user_id);
                     }
                     RealmUserEvent::Remove(id) => {
                         if let Some(u) = self.users.get_mut(id) {
                             u.deactivated = true;
+                            ch.user_ids.insert(*id);
                         }
                     }
                     RealmUserEvent::Update(v) => {
+                        if let Some(id) = v["user_id"].as_u64() {
+                            ch.user_ids.insert(id);
+                        }
                         if let Some(u) = v["user_id"].as_u64().and_then(|id| self.users.get_mut(&id)) {
                             if let Some(o) = v.as_object() {
                                 for (k, val) in o {
@@ -456,6 +476,7 @@ impl State {
             Event::MutedUsers(m) => {
                 self.muted_users = m.iter().map(|m| m.id).collect();
                 ch.users = true;
+                ch.muted_users = true;
             }
             Event::RealmEmoji(e) => self.realm_emoji = e.clone(),
             Event::Other { kind, .. } => *self.unmodeled.entry(kind.clone()).or_default() += 1,
@@ -482,6 +503,7 @@ impl State {
                     self.mentions.remove(&id);
                 }
                 ch.unreads = true;
+                ch.unread_ids.insert(id);
             }
         }
         if !u.is_move() {
@@ -496,6 +518,7 @@ impl State {
             if let Some(c) = self.unread.get_mut(&id) {
                 ch.convs.insert(std::mem::replace(c, Conv::Topic(new_key.clone())));
                 ch.unreads = true;
+                ch.unread_ids.insert(id);
             }
             if let Some(m) = self.messages.get_mut(&id) {
                 ch.convs.insert(conv_of(self.me, m));

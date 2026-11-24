@@ -68,6 +68,8 @@ pub struct Overlay {
     pub inline: HashMap<MessageId, Vec<InlineReaction>>,
     anchors: HashMap<TopicKey, Option<Anchor>>,
     anchors_loading: HashSet<TopicKey>,
+    /// When fetching a topic's anchor last failed.
+    anchors_failed: HashMap<TopicKey, Instant>,
     /// Threads started from a message, by that message's id.
     pub threads: HashMap<MessageId, Vec<Thread>>,
     thread_checks: HashMap<TopicKey, Instant>,
@@ -80,13 +82,20 @@ pub struct Overlay {
     /// A batch of score and inline queries is scheduled (the task is detached: clearing a
     /// held `Task` from inside itself would cancel it at its next await).
     flush_scheduled: bool,
-    times: HashMap<MessageId, i64>,
-    times_pending: HashSet<MessageId>,
-    times_scheduled: bool,
     _retry: Option<Task<()>>,
+    /// The wait before the next sign-in attempt while the service is unreachable: doubles
+    /// from 10 s to 5 minutes, back to 10 s once signed in.
+    retry_delay: Duration,
 }
 
 impl EventEmitter<Rc<OverlayChanged>> for Overlay {}
+
+/// Topic anchors fetched at once, and how long a failed one waits before it's asked again.
+const MAX_ANCHOR_REQUESTS: usize = 8;
+const ANCHOR_RETRY: Duration = Duration::from_secs(60);
+
+/// The first wait before signing in to the overlay again.
+const RETRY_FIRST: Duration = Duration::from_secs(10);
 
 fn token_key(service: &str, user_id: u64) -> String {
     format!("overlay {user_id} @ {service}")
@@ -106,6 +115,7 @@ impl Overlay {
             inline: HashMap::new(),
             anchors: HashMap::new(),
             anchors_loading: HashSet::new(),
+            anchors_failed: HashMap::new(),
             threads: HashMap::new(),
             thread_checks: HashMap::new(),
             snippets: HashMap::new(),
@@ -114,10 +124,8 @@ impl Overlay {
             pending_messages: HashSet::new(),
             pending_topics: HashSet::new(),
             flush_scheduled: false,
-            times: HashMap::new(),
-            times_pending: HashSet::new(),
-            times_scheduled: false,
             _retry: None,
+            retry_delay: RETRY_FIRST,
         };
         this.sign_in(cx);
         this
@@ -174,6 +182,7 @@ impl Overlay {
                         this.session = Some(puzil_overlay::Session { service: this.service.clone(), token });
                         this.status = Status::Ready;
                         this._retry = None;
+                        this.retry_delay = RETRY_FIRST;
                         // Anything asked for while signing in.
                         this.queried.clear();
                         this.schedule_flush(cx);
@@ -195,8 +204,10 @@ impl Overlay {
     }
 
     fn retry_later(&mut self, cx: &mut Context<Self>) {
+        let wait = self.retry_delay;
+        self.retry_delay = (wait * 2).min(Duration::from_secs(300));
         self._retry = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(10)).await;
+            cx.background_executor().timer(wait).await;
             let _ = this.update(cx, |this, cx| this.sign_in(cx));
         }));
     }
@@ -354,9 +365,15 @@ impl Overlay {
             }
             return a;
         }
-        if !self.anchors_loading.insert(key.clone()) {
+        // At most a few at once (a channel can have hundreds of topics, each one request), and
+        // not again soon after a failure: the sidebar asks on every redraw.
+        if self.anchors_loading.contains(key)
+            || self.anchors_loading.len() >= MAX_ANCHOR_REQUESTS
+            || self.anchors_failed.get(key).is_some_and(|t| t.elapsed() < ANCHOR_RETRY)
+        {
             return None;
         }
+        self.anchors_loading.insert(key.clone());
         let narrow = serde_json::json!([
             {"operator": "channel", "operand": key.stream_id},
             {"operator": "topic", "operand": topic},
@@ -373,10 +390,14 @@ impl Overlay {
                             this.want_topic(a.id, cx);
                         }
                         this.anchors.insert(key, a);
-                        this.emit(OverlayChanged::default(), cx);
                     }
-                    Err(e) => tracing::debug!("topic anchor: {e}"),
+                    Err(e) => {
+                        tracing::debug!("topic anchor: {e}");
+                        this.anchors_failed.insert(key, Instant::now());
+                    }
                 }
+                // Lets the sidebar ask for the next ones.
+                this.emit(OverlayChanged::default(), cx);
             });
         })
         .detach();
@@ -467,44 +488,6 @@ impl Overlay {
                     });
                     this.snippets.insert(id, v);
                     this.emit(OverlayChanged { threads: true, ..Default::default() }, cx);
-                });
-            })
-            .detach();
-        }
-        None
-    }
-}
-
-impl Overlay {
-    /// When a topic's latest message was sent, for "Hot" sorting; fetched in batches.
-    pub fn message_time(&mut self, id: MessageId, cx: &mut Context<Self>) -> Option<i64> {
-        if let Some(t) = self.times.get(&id) {
-            return Some(*t);
-        }
-        if self.times_pending.insert(id) && !self.times_scheduled {
-            self.times_scheduled = true;
-            let zulip = self.zulip.clone();
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(Duration::from_millis(100)).await;
-                let Ok(ids) = this.update(cx, |this, _| {
-                    this.times_scheduled = false;
-                    this.times_pending.drain().collect::<Vec<_>>()
-                }) else {
-                    return;
-                };
-                let r = on_tokio(async move {
-                    let mut out = Vec::new();
-                    for chunk in ids.chunks(100) {
-                        out.extend(zulip.messages_by_id_raw(chunk).await?.into_iter().map(|m| (m.id, m.timestamp)));
-                    }
-                    Ok::<_, puzil_zulip::ApiError>(out)
-                })
-                .await;
-                let _ = this.update(cx, |this, cx| {
-                    if let Ok(v) = r {
-                        this.times.extend(v);
-                        this.emit(OverlayChanged::default(), cx);
-                    }
                 });
             })
             .detach();
