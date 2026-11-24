@@ -69,6 +69,8 @@ pub struct Changes {
     pub user_ids: HashSet<UserId>,
     /// The muted-users list changed.
     pub muted_users: bool,
+    /// Organization permissions, user groups or default channels changed (the realm record).
+    pub realm: bool,
     pub user_topics: bool,
     /// Everything may have changed (re-register).
     pub all: bool,
@@ -88,6 +90,14 @@ pub struct RealmInfo {
     /// Channel folders, in the organization's order.
     #[serde(default)]
     pub channel_folders: Vec<crate::types::ChannelFolder>,
+    /// User groups, the role groups included, for permissions.
+    #[serde(default)]
+    pub user_groups: Vec<UserGroup>,
+    #[serde(default)]
+    pub perms: RealmPerms,
+    /// Channels new users join.
+    #[serde(default)]
+    pub default_streams: Vec<StreamId>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,6 +190,9 @@ impl State {
                 f.sort_by_key(|f| f.order);
                 f
             },
+            user_groups: r.realm_user_groups.clone(),
+            perms: r.perms.clone(),
+            default_streams: default_stream_ids(&r.realm_default_streams),
         };
         // The server's list is authoritative after a register.
         self.recent_dms.clear();
@@ -269,7 +282,7 @@ impl State {
                 self.messages.insert(m.id, m);
             }
             Event::UpdateMessage(u) => self.update_message(u, ch),
-            Event::DeleteMessage { message_ids } => {
+            Event::DeleteMessage { message_ids, .. } => {
                 for id in message_ids {
                     self.mark_read(*id, ch);
                     if let Some(m) = self.messages.remove(id) {
@@ -355,7 +368,7 @@ impl State {
             Event::Subscription(s) => {
                 // peer_add / peer_remove (someone else joined or left) are the common ones, and
                 // nothing modeled changes: no rewrite of the streams tables, no redraw.
-                ch.streams = !matches!(s, SubscriptionEvent::Other(_));
+                ch.streams = !matches!(s, SubscriptionEvent::Other(_) | SubscriptionEvent::Peers { .. });
                 match s {
                     SubscriptionEvent::Add(pairs) => {
                         for (st, sub) in pairs {
@@ -365,12 +378,26 @@ impl State {
                     }
                     SubscriptionEvent::Remove(ids) => {
                         for id in ids {
-                            self.subs.remove(id);
+                            if self.subs.remove(id).is_some()
+                                && let Some(st) = self.streams.get_mut(id)
+                            {
+                                st.subscriber_count = st.subscriber_count.saturating_sub(1);
+                            }
                         }
                     }
                     SubscriptionEvent::Update { stream_id, property, value } => {
                         if let Some(sub) = self.subs.get_mut(stream_id) {
                             set_field(sub, property, value);
+                        }
+                    }
+                    // Counted in memory only: a rewrite of the channels table for every join
+                    // anywhere isn't worth it (register brings the counts up to date).
+                    SubscriptionEvent::Peers { add, stream_ids, user_ids } => {
+                        for sid in stream_ids {
+                            if let Some(st) = self.streams.get_mut(sid) {
+                                let n = user_ids.len() as u64;
+                                st.subscriber_count = if *add { st.subscriber_count + n } else { st.subscriber_count.saturating_sub(n) };
+                            }
                         }
                     }
                     SubscriptionEvent::Other(o) => *self.unmodeled.entry(format!("subscription/{o}")).or_default() += 1,
@@ -425,9 +452,14 @@ impl State {
                             }
                         }
                     }
-                    StreamEvent::Update { stream_id, property, value } => {
+                    StreamEvent::Update { stream_id, property, value, raw } => {
                         if let Some(st) = self.streams.get_mut(stream_id) {
                             set_field(st, property, value);
+                            for extra in ["rendered_description", "history_public_to_subscribers", "is_web_public"] {
+                                if let Some(v) = raw.get(extra) {
+                                    set_field(st, extra, v);
+                                }
+                            }
                         }
                     }
                     StreamEvent::Other(o) => *self.unmodeled.entry(format!("stream/{o}")).or_default() += 1,
@@ -479,7 +511,80 @@ impl State {
                 ch.muted_users = true;
             }
             Event::RealmEmoji(e) => self.realm_emoji = e.clone(),
+            Event::Realm(v) => {
+                let perms = &mut self.realm.perms;
+                let before = perms.clone();
+                match v["op"].as_str() {
+                    Some("update") => {
+                        if let Some(p) = v["property"].as_str() {
+                            set_field(perms, p, &v["value"]);
+                        }
+                    }
+                    _ => {
+                        for (k, val) in v["data"].as_object().into_iter().flatten() {
+                            set_field(perms, k, val);
+                        }
+                    }
+                }
+                ch.realm |= *perms != before;
+            }
+            // Kept in memory only: groups change with every signup, register refreshes them, and
+            // nothing on screen shows them (menus check permissions as they open).
+            Event::UserGroup(v) => self.apply_user_group(v),
+            Event::DefaultStreams(list) => {
+                self.realm.default_streams = default_stream_ids(list);
+                ch.realm = true;
+            }
             Event::Other { kind, .. } => *self.unmodeled.entry(kind.clone()).or_default() += 1,
+        }
+    }
+
+    fn apply_user_group(&mut self, v: &serde_json::Value) {
+        let groups = &mut self.realm.user_groups;
+        let id = v["group_id"].as_u64();
+        let ids = |k: &str| -> Vec<u64> { v[k].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).collect() };
+        match v["op"].as_str() {
+            Some("add") => {
+                if let Ok(g) = serde_json::from_value::<UserGroup>(v["group"].clone()) {
+                    groups.retain(|o| o.id != g.id);
+                    groups.push(g);
+                }
+            }
+            Some("remove") => groups.retain(|g| Some(g.id) != id),
+            Some(op) => {
+                let Some(g) = groups.iter_mut().find(|g| Some(g.id) == id) else { return };
+                match op {
+                    "update" => {
+                        for (k, val) in v["data"].as_object().into_iter().flatten() {
+                            set_field(g, k, val);
+                        }
+                    }
+                    "add_members" => {
+                        for u in ids("user_ids") {
+                            if !g.members.contains(&u) {
+                                g.members.push(u);
+                            }
+                        }
+                    }
+                    "remove_members" => {
+                        let gone = ids("user_ids");
+                        g.members.retain(|u| !gone.contains(u));
+                    }
+                    "add_subgroups" => {
+                        for s in ids("direct_subgroup_ids") {
+                            if !g.direct_subgroup_ids.contains(&s) {
+                                g.direct_subgroup_ids.push(s);
+                            }
+                        }
+                    }
+                    "remove_subgroups" => {
+                        let gone = ids("direct_subgroup_ids");
+                        g.direct_subgroup_ids.retain(|s| !gone.contains(s));
+                    }
+                    _ => {}
+                }
+            }
+            None => {}
         }
     }
 
@@ -557,6 +662,19 @@ impl State {
         }
     }
 
+    /// The topic's name as the server has it: `""` for general chat (not its display label).
+    /// What requests about the topic must send.
+    pub fn topic_name(&self, k: &TopicKey) -> String {
+        self.topic_names.get(k).cloned().unwrap_or_else(|| k.topic.clone())
+    }
+
+    /// What's typed as a topic name, as the server should get it: the general chat label
+    /// (in any case) means the empty topic.
+    pub fn topic_from_typed(&self, typed: &str) -> String {
+        let t = typed.trim();
+        if t.to_lowercase() == self.empty_topic_name.to_lowercase() { String::new() } else { t.to_string() }
+    }
+
     pub fn topic_display(&self, k: &TopicKey) -> String {
         match self.topic_names.get(k) {
             Some(t) if t.is_empty() => self.empty_topic_name.clone(),
@@ -621,4 +739,9 @@ impl Conv {
             Conv::Dm(k) => crate::client::Dest::Dm(k.others(me).collect()),
         }
     }
+}
+
+/// Default channels arrive as ids (current servers) or channel objects (older ones).
+fn default_stream_ids(list: &[serde_json::Value]) -> Vec<StreamId> {
+    list.iter().filter_map(|v| v.as_u64().or_else(|| v["stream_id"].as_u64())).collect()
 }

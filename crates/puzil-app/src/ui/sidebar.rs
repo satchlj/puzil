@@ -28,6 +28,11 @@ pub enum SidebarEvent {
     Browse,
     /// Open Settings.
     Settings,
+    /// Open the Move dialog for a topic: how, which topic, a message in it, and the
+    /// destination channel when it was dropped on one.
+    Move(super::move_dialog::MoveMode, puzil_zulip::model::TopicKey, u64, Option<StreamId>),
+    /// Show a channel's settings.
+    ChannelSettings(puzil_zulip::types::StreamId),
 }
 
 
@@ -88,7 +93,40 @@ impl Sort {
 /// Unread counts per conversation and per channel.
 type Counts = (HashMap<Conv, Count>, HashMap<StreamId, Count>);
 
+/// A topic being dragged onto a channel (Settings: Drag topics to move them).
+#[derive(Clone)]
+pub struct TopicDrag {
+    pub key: TopicKey,
+    pub name: String,
+    pub anchor: u64,
+}
+
+/// What follows the pointer while a topic is dragged.
+struct DragGhost {
+    label: String,
+    theme: Rc<Theme>,
+}
+
+impl Render for DragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let t = &self.theme;
+        div()
+            .px_2p5()
+            .py_1()
+            .rounded(px(5.))
+            .bg(t.popover)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .text_size(px(13.))
+            .text_color(t.fg_strong)
+            .child(self.label.clone())
+    }
+}
+
 pub struct Sidebar {
+    /// Topics can be dragged onto channels (from Settings).
+    drag_topics: bool,
     /// The unread counts, kept until the session next changes: counting walks every unread
     /// message (tens of thousands with a Zulip backlog), and the sidebar also redraws for
     /// hovers and images.
@@ -133,7 +171,11 @@ struct Node {
     topic: Option<(String, TopicKey)>,
     label: String,
     path: String,
+    /// The newest message at or under this path (folders rank by it).
     max_id: MessageId,
+    /// The newest message of this node's own topic: what whole-topic actions are sent with
+    /// (`max_id` may be a sub-topic's). Zero when it isn't known.
+    own_max: MessageId,
     count: Count,
     children: Vec<Node>,
 }
@@ -184,6 +226,7 @@ impl Sidebar {
             reveal: None,
             rail_toggled: None,
             menu: None,
+            drag_topics: false,
             saved_path,
             last_saved: Some(saved.clone()),
             collapsed_groups: saved.collapsed_groups.iter().cloned().collect(),
@@ -373,6 +416,7 @@ impl Sidebar {
                 node.count.add(count);
             }
             node.topic = Some((display.clone(), key));
+            node.own_max = max_id;
         }
         // A folder ranks by its best topic.
         fn value(n: &Node, values: &HashMap<TopicKey, f64>) -> f64 {
@@ -464,6 +508,7 @@ impl Sidebar {
             })
             .collect();
         let last = visible.len().saturating_sub(1);
+        let mut movable: Option<bool> = None;
         for (i, n) in visible.into_iter().enumerate() {
             let folder = !n.children.is_empty();
             let open = self.open_folders.contains(&(sid, n.path.clone()));
@@ -518,7 +563,18 @@ impl Sidebar {
                     if folder && open { n.topic.as_ref().map(|_| Count::default()).unwrap_or(n.count) } else { n.count },
                 ));
             if let Some((name, k)) = n.topic.clone() {
-                let anchor = n.max_id;
+                let anchor = n.own_max;
+                // Checked only with dragging on (it walks group memberships), once per channel.
+                if self.drag_topics && anchor > 0 && *movable.get_or_insert_with(|| {
+                    let st = &self.session.read(cx).state;
+                    st.can_move(sid, puzil_zulip::perms::Move::Topic) || st.can_move(sid, puzil_zulip::perms::Move::Channel)
+                }) {
+                    let theme = t.clone();
+                    row = row.on_drag(TopicDrag { key: k.clone(), name: name.clone(), anchor }, move |d, _, _, cx| {
+                        let (label, theme) = (d.name.clone(), theme.clone());
+                        cx.new(|_| DragGhost { label, theme })
+                    });
+                }
                 row = row.on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, e: &MouseDownEvent, _, cx| {
@@ -739,6 +795,7 @@ impl Render for Sidebar {
         let dms_shown = prefs.dms_shown;
         let active_secs = prefs.active_days as i64 * 24 * 3600;
         let show_muted = prefs.show_muted_channels;
+        self.drag_topics = prefs.drag_topics;
         let menu = self.render_menu(cx);
         self.persist();
         let t = self.theme.clone();
@@ -1044,6 +1101,12 @@ impl Render for Sidebar {
                             MouseButton::Right,
                             cx.listener(move |this, e: &MouseDownEvent, _, cx| this.open_menu(SideMenu::Channel(sid), e.position, cx)),
                         )
+                        .when(self.drag_topics, |d| {
+                            let tint = t.bg_selected;
+                            d.drag_over::<TopicDrag>(move |s, _, _, _| s.bg(tint)).on_drop(cx.listener(move |_, drag: &TopicDrag, _, cx| {
+                                cx.emit(SidebarEvent::Move(super::move_dialog::MoveMode::Topic, drag.key.clone(), drag.anchor, Some(sid)));
+                            }))
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.expanded.contains(&sid) {
                                 this.expanded.remove(&sid);

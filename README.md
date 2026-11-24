@@ -6,6 +6,7 @@ A fast native [Zulip](https://zulip.com) client for macOS and Linux, written in 
 - **Familiar:** a Discord-style layout with Zulip's model underneath: channels, channel folders, topics (with `Parent / Child` nesting), and direct messages.
 - **Complete rendering:** Markdown, code with highlighting, typeset math (Typst), images with a lightbox, file attachments, spoilers, reactions, mentions.
 - **Keyboard first:** ⌘K jumps anywhere, ⌘F searches (local index plus the server), ↑ selects messages, Enter edits or replies. On Linux, Ctrl stands in for ⌘.
+- **Organized:** rename, move, merge and split topics; create channels and manage their settings, permissions and subscribers, as far as your organization allows.
 - **Yours:** six themes in light and dark, app-wide settings that each server can override, and your Zulip notification, privacy and profile settings without opening the web app.
 - **Several servers** side by side, each syncing in the background.
 

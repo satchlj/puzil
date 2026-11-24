@@ -150,6 +150,13 @@ pub struct Session {
     /// updated in place when we change one.
     pub user_settings: serde_json::Value,
     typing: Typing,
+    /// Subscriber lists fetched for Channel settings, kept current from peer events.
+    members: HashMap<StreamId, Vec<UserId>>,
+    members_loading: HashSet<StreamId>,
+    /// Channels whose member list failed to load (asked again when their settings reopen).
+    members_failed: HashSet<StreamId>,
+    /// Bumped on each new event queue: a member list fetched before it may miss peer events.
+    members_gen: u64,
     /// Clears typing that lapsed without a stop; armed for the next lapse.
     typing_lapse: Option<Task<()>>,
     /// Sends stop once we pause typing.
@@ -230,6 +237,10 @@ impl Session {
             registered_once: false,
             user_settings: serde_json::Value::Null,
             typing: Typing::default(),
+            members: HashMap::new(),
+            members_loading: HashSet::new(),
+            members_failed: HashSet::new(),
+            members_gen: 0,
             typing_lapse: None,
             typing_idle: None,
             typing_out,
@@ -260,6 +271,10 @@ impl Session {
                         d.fresh = false;
                     }
                     self.topics.clear();
+                    // Peer events were lost with the old queue.
+                    self.members.clear();
+                    self.members_loading.clear();
+                    self.members_gen += 1;
                     // Topics that failed while we were cut off are asked for again now.
                     self.topics_failed.clear();
                     if first {
@@ -285,7 +300,12 @@ impl Session {
                             moved_streams.extend(u.stream_id);
                             moved_streams.extend(u.new_stream_id);
                         }
+                        // A deletion may empty a topic (Delete topic does): its list is refetched.
+                        if let Event::DeleteMessage { stream_id: Some(sid), .. } = e {
+                            moved_streams.insert(*sid);
+                        }
                         typing.extend(self.note_typing(e));
+                        changed |= self.note_members(e);
                     }
                     let ch = self.state.apply_all(&events);
                     self.store.write(puzil_store::writes_for(&self.state, &ch));
@@ -334,6 +354,74 @@ impl Session {
         }
         cx.emit(Rc::new(up));
         cx.notify();
+    }
+
+    // ---- Channel members ----
+
+    /// Who's subscribed to `sid`, once [`Self::load_members`] fetched it.
+    pub fn members(&self, sid: StreamId) -> Option<&Vec<UserId>> {
+        self.members.get(&sid)
+    }
+
+    pub fn members_failed(&self, sid: StreamId) -> bool {
+        self.members_failed.contains(&sid)
+    }
+
+    pub fn load_members(&mut self, sid: StreamId, cx: &mut Context<Self>) {
+        if self.members.contains_key(&sid) || !self.members_loading.insert(sid) {
+            return;
+        }
+        self.members_failed.remove(&sid);
+        let (client, generation) = (self.client.clone(), self.members_gen);
+        cx.spawn(async move |this, cx| {
+            let r = on_tokio(async move { client.channel_members(sid).await }).await;
+            let _ = this.update(cx, |s, cx| {
+                if s.members_gen != generation {
+                    return;
+                }
+                s.members_loading.remove(&sid);
+                match r {
+                    Ok(mut ids) => {
+                        ids.sort_unstable();
+                        s.members.insert(sid, ids);
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        tracing::warn!("members of {sid}: {e}");
+                        s.members_failed.insert(sid);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Keeps fetched member lists current. Returns whether one changed.
+    fn note_members(&mut self, e: &Event) -> bool {
+        use puzil_zulip::events::SubscriptionEvent as S;
+        let me = self.state.me;
+        let (add, sids, users): (bool, Vec<StreamId>, Vec<UserId>) = match e {
+            Event::Subscription(S::Peers { add, stream_ids, user_ids }) => (*add, stream_ids.clone(), user_ids.clone()),
+            Event::Subscription(S::Add(pairs)) => (true, pairs.iter().map(|(st, _)| st.stream_id).collect(), vec![me]),
+            Event::Subscription(S::Remove(ids)) => (false, ids.clone(), vec![me]),
+            _ => return false,
+        };
+        let mut changed = false;
+        for sid in sids {
+            let Some(list) = self.members.get_mut(&sid) else { continue };
+            for u in &users {
+                match (add, list.binary_search(u)) {
+                    (true, Err(i)) => list.insert(i, *u),
+                    (false, Ok(i)) => {
+                        list.remove(i);
+                    }
+                    _ => continue,
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     // ---- Typing ----
@@ -463,7 +551,8 @@ impl Session {
             let Conv::Topic(k) = c else { continue };
             let Some(list) = self.topics.get_mut(&k.stream_id) else { continue };
             let Some(max) = self.by_conv.get(c).and_then(|s| s.last().copied()) else { continue };
-            let name = self.state.topic_display(k);
+            // The server's name (`""` for general chat), as the server's own list has it.
+            let name = self.state.topic_name(k);
             match list.iter_mut().find(|t| t.name.to_lowercase() == k.topic) {
                 Some(t) => t.max_id = t.max_id.max(max),
                 None => list.push(TopicInfo { name, max_id: max }),
@@ -839,6 +928,10 @@ impl Session {
                 match r {
                     Ok(t) => {
                         s.topics_failed.remove(&sid);
+                        // The server's spelling: requests about a topic must send it, not the lowercased key.
+                        for info in &t {
+                            s.state.topic_names.entry(puzil_zulip::model::TopicKey::new(sid, &info.name)).or_insert_with(|| info.name.clone());
+                        }
                         s.topics.insert(sid, t);
                         cx.emit(Rc::new(Updated { sidebar: true, ..Default::default() }));
                         cx.notify();

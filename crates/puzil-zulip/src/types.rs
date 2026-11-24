@@ -58,6 +58,154 @@ pub struct Stream {
     /// The channel folder it's filed in (Zulip 11+).
     #[serde(default)]
     pub folder_id: Option<i64>,
+    #[serde(default)]
+    pub creator_id: Option<UserId>,
+    /// Whether the "general chat" (empty) topic is allowed: `inherit`, `allow_empty_topic`,
+    /// `disable_empty_topic` or `empty_topic_only` (Zulip 11+).
+    #[serde(default)]
+    pub topics_policy: String,
+    /// Days messages are kept; `None` means the organization's default.
+    #[serde(default)]
+    pub message_retention_days: Option<i64>,
+    #[serde(default)]
+    pub subscriber_count: u64,
+    /// Who may do what in this channel. Each is a user group or an ad hoc set of people and groups.
+    #[serde(default)]
+    pub can_administer_channel_group: GroupSetting,
+    #[serde(default)]
+    pub can_send_message_group: GroupSetting,
+    #[serde(default)]
+    pub can_create_topic_group: GroupSetting,
+    #[serde(default)]
+    pub can_move_messages_within_channel_group: GroupSetting,
+    #[serde(default)]
+    pub can_move_messages_out_of_channel_group: GroupSetting,
+    #[serde(default)]
+    pub can_resolve_topics_group: GroupSetting,
+    #[serde(default)]
+    pub can_delete_any_message_group: GroupSetting,
+    #[serde(default)]
+    pub can_delete_own_message_group: GroupSetting,
+    #[serde(default)]
+    pub can_subscribe_group: GroupSetting,
+    #[serde(default)]
+    pub can_add_subscribers_group: GroupSetting,
+    #[serde(default)]
+    pub can_remove_subscribers_group: GroupSetting,
+}
+
+/// A permission setting: a user group by id, or an ad hoc set of users and groups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GroupSetting {
+    Group(u64),
+    Custom {
+        #[serde(default)]
+        direct_members: Vec<UserId>,
+        #[serde(default)]
+        direct_subgroups: Vec<u64>,
+    },
+}
+
+impl RealmPerms {
+    /// From a register response, field by field: one setting of an unexpected shape keeps its
+    /// default instead of discarding the rest.
+    pub fn from_register(raw: &Value) -> Self {
+        let mut v = serde_json::to_value(Self::default()).unwrap_or_default();
+        let keys: Vec<String> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+        for k in keys {
+            let Some(x) = raw.get(format!("realm_{k}")) else { continue };
+            let mut trial = v.clone();
+            trial[&k] = x.clone();
+            if serde_json::from_value::<Self>(trial).is_ok() {
+                v[&k] = x.clone();
+            } else {
+                tracing::warn!("organization setting {k} unreadable: {x}");
+            }
+        }
+        let mut p: Self = serde_json::from_value(v).unwrap_or_default();
+        p.channel_setting_rules =
+            serde_json::from_value(raw["server_supported_permission_settings"]["stream"].clone()).unwrap_or_default();
+        p
+    }
+}
+
+impl Default for GroupSetting {
+    /// Nobody: what an absent setting allows.
+    fn default() -> Self {
+        Self::Custom { direct_members: Vec::new(), direct_subgroups: Vec::new() }
+    }
+}
+
+/// A user group, including the role groups (`role:members`, `role:administrators`, …).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserGroup {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub members: Vec<UserId>,
+    #[serde(default)]
+    pub direct_subgroup_ids: Vec<u64>,
+    #[serde(default)]
+    pub is_system_group: bool,
+    #[serde(default)]
+    pub deactivated: bool,
+}
+
+/// The organization's permission settings that decide what Puzil offers. Register sends
+/// them as `realm_<name>`; realm update events as `<name>`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RealmPerms {
+    #[serde(default, alias = "realm_can_create_public_channel_group")]
+    pub can_create_public_channel_group: GroupSetting,
+    #[serde(default, alias = "realm_can_create_private_channel_group")]
+    pub can_create_private_channel_group: GroupSetting,
+    #[serde(default, alias = "realm_can_create_web_public_channel_group")]
+    pub can_create_web_public_channel_group: GroupSetting,
+    #[serde(default, alias = "realm_can_move_messages_between_topics_group")]
+    pub can_move_messages_between_topics_group: GroupSetting,
+    #[serde(default, alias = "realm_can_move_messages_between_channels_group")]
+    pub can_move_messages_between_channels_group: GroupSetting,
+    #[serde(default, alias = "realm_can_resolve_topics_group")]
+    pub can_resolve_topics_group: GroupSetting,
+    #[serde(default, alias = "realm_can_delete_any_message_group")]
+    pub can_delete_any_message_group: GroupSetting,
+    #[serde(default, alias = "realm_can_add_subscribers_group")]
+    pub can_add_subscribers_group: GroupSetting,
+    #[serde(default, alias = "realm_can_remove_subscribers_group")]
+    pub can_remove_subscribers_group: GroupSetting,
+    /// Seconds after sending that a message may still be moved; `None` is no limit.
+    #[serde(default, alias = "realm_move_messages_within_stream_limit_seconds")]
+    pub move_messages_within_stream_limit_seconds: Option<u64>,
+    #[serde(default, alias = "realm_move_messages_between_streams_limit_seconds")]
+    pub move_messages_between_streams_limit_seconds: Option<u64>,
+    #[serde(default, alias = "realm_topics_policy")]
+    pub topics_policy: String,
+    #[serde(default, alias = "realm_message_retention_days")]
+    pub message_retention_days: Option<i64>,
+    #[serde(default, alias = "realm_enable_spectator_access")]
+    pub enable_spectator_access: bool,
+    /// Who may change a channel's "general chat" policy (with channel admin rights).
+    #[serde(default, alias = "realm_can_set_topics_policy_group")]
+    pub can_set_topics_policy_group: GroupSetting,
+    /// Which values each channel permission accepts (`server_supported_permission_settings`).
+    #[serde(default)]
+    pub channel_setting_rules: std::collections::HashMap<String, SettingRule>,
+}
+
+/// What a permission setting may be set to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingRule {
+    #[serde(default = "yes")]
+    pub allow_everyone_group: bool,
+    #[serde(default = "yes")]
+    pub allow_nobody_group: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// An organization's channel folder (Zulip 11+).
@@ -240,6 +388,14 @@ pub struct Register {
     pub max_file_upload_size_mib: Option<u32>,
     #[serde(default)]
     pub recent_private_conversations: Vec<RecentDm>,
+    #[serde(default)]
+    pub realm_user_groups: Vec<UserGroup>,
+    /// Channels new users join; ids, or channel objects on older servers.
+    #[serde(default)]
+    pub realm_default_streams: Vec<Value>,
+    /// Parsed from the raw response by `queue::register` (the fields are scattered across it).
+    #[serde(skip)]
+    pub perms: RealmPerms,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

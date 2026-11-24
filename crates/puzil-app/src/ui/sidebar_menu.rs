@@ -7,8 +7,12 @@ use puzil_zulip::{
 };
 use serde_json::json;
 
-use super::sidebar::Sidebar;
+use super::{
+    move_dialog::MoveMode,
+    sidebar::{Sidebar, SidebarEvent},
+};
 use crate::{icons, session::Session};
+use puzil_zulip::perms::Move;
 
 #[derive(Debug, Clone)]
 pub enum SideMenu {
@@ -16,6 +20,34 @@ pub enum SideMenu {
     /// A topic: its key, display name, and a message in it (renames go through one).
     Topic(TopicKey, String, u64),
     Dm(DmKey),
+}
+
+/// Asks, then deletes a whole topic; says so if that fails part way (the server works in
+/// batches, so a dropped connection can leave some of it).
+pub(crate) fn delete_topic(session: Entity<Session>, sid: puzil_zulip::types::StreamId, topic: String, display: &str, window: &mut Window, cx: &mut App) {
+    let answer = window.prompt(
+        PromptLevel::Critical,
+        &format!("Delete \"{display}\"?"),
+        Some("Every message in the topic is deleted, for everyone. This can't be undone."),
+        &["Delete", "Cancel"],
+        cx,
+    );
+    window
+        .spawn(cx, async move |cx| {
+            if answer.await.ok() != Some(0) {
+                return;
+            }
+            let Ok(client) = cx.update(|_, cx| session.read(cx).client.clone()) else { return };
+            let r = crate::runtime::on_tokio(async move { client.delete_topic(sid, &topic).await }).await;
+            if let Err(e) = r {
+                let detail = match e {
+                    puzil_zulip::ApiError::Api { msg, .. } if !msg.is_empty() => msg,
+                    e => e.to_string(),
+                };
+                let _ = cx.prompt(PromptLevel::Warning, "The topic wasn't fully deleted", Some(&detail), &["OK"]).await;
+            }
+        })
+        .detach();
 }
 
 /// Runs a server call for a menu item, logging a failure.
@@ -109,6 +141,10 @@ impl Sidebar {
                 let s3 = session.clone();
                 menu = menu
                     .child(mark_read("m-read", json!([{ "operator": "channel", "operand": sid }])))
+                    .child(item("m-settings", "Channel settings".into(), "settings-2", false).on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        cx.emit(SidebarEvent::ChannelSettings(sid));
+                    })))
                     .child(item("m-mute", if muted { "Unmute channel" } else { "Mute channel" }.into(), "bell-off", false).on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
@@ -135,8 +171,22 @@ impl Sidebar {
                         .detach();
                     })));
             }
-            SideMenu::Topic(k, name, anchor) => {
+            SideMenu::Topic(k, display, anchor) => {
+                // Requests take the server's name (`""` for general chat), not the label shown.
+                let name = session.read(cx).state.topic_name(&k);
                 let policy = session.read(cx).state.user_topics.get(&k).copied().unwrap_or(Visibility::Inherit);
+                let (can_rename, can_move_out, can_resolve, can_delete, channel_muted) = {
+                    let st = &session.read(cx).state;
+                    // Whole-topic changes go through a message of the topic: none known, none offered.
+                    let known = anchor > 0;
+                    (
+                        known && st.can_move(k.stream_id, Move::Topic),
+                        known && st.can_move(k.stream_id, Move::Channel),
+                        known && !name.is_empty() && st.can_resolve(k.stream_id),
+                        st.can_delete_topic(k.stream_id),
+                        st.subs.get(&k.stream_id).is_some_and(|s| s.is_muted),
+                    )
+                };
                 let link = format!("{realm}/#narrow/channel/{}/topic/{}", k.stream_id, puzil_overlay::encode_hash_component(&name));
                 let resolved = name.starts_with(puzil_overlay::RESOLVED_PREFIX);
                 let renamed = if resolved {
@@ -162,20 +212,53 @@ impl Sidebar {
                     Visibility::Followed => menu.child(set("m-follow", "Unfollow topic", "bell-off", 0)),
                     _ => menu.child(set("m-follow", "Follow topic", "bell", 3)),
                 };
-                menu = match policy {
-                    Visibility::Muted => menu.child(set("m-mute", "Unmute topic", "volume-x", 0)),
+                // In a muted channel, topics are muted unless unmuted one by one.
+                menu = match (policy, channel_muted) {
+                    // In a muted channel, inheriting is muted too: unmuting there is explicit.
+                    (Visibility::Muted, _) => menu.child(set("m-mute", "Unmute topic", "volume-x", if channel_muted { 2 } else { 0 })),
+                    // Followed already shows in a muted channel; muting replaces following.
+                    (Visibility::Followed, _) => menu.child(set("m-mute", "Mute topic", "volume-x", 1)),
+                    (Visibility::Unmuted, true) => menu.child(set("m-mute", "Mute topic", "volume-x", 0)),
+                    (_, true) => menu.child(set("m-mute", "Unmute topic", "volume-2", 2)),
                     _ => menu.child(set("m-mute", "Mute topic", "volume-x", 1)),
                 };
-                menu = menu
-                    .child(
+                if can_resolve {
+                    menu = menu.child(
                         item("m-resolve", if resolved { "Mark as unresolved" } else { "Mark as resolved" }.into(), "circle-check", false)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 let to = renamed.clone();
                                 call(&s2, cx, "resolving", move |c| async move { c.rename_topic(anchor, &to).await });
                             })),
-                    )
-                    .child(copy("m-link", link));
+                    );
+                }
+                menu = menu.child(copy("m-link", link));
+                if can_rename || can_move_out {
+                    menu = menu.child(sep());
+                }
+                if can_rename {
+                    let k2 = k.clone();
+                    menu = menu.child(item("m-rename", "Rename topic…".into(), "pencil", false).on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        cx.emit(SidebarEvent::Move(MoveMode::Rename, k2.clone(), anchor, None));
+                    })));
+                }
+                if can_rename || can_move_out {
+                    let k2 = k.clone();
+                    menu = menu.child(item("m-move", "Move topic…".into(), "folder-input", false).on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        cx.emit(SidebarEvent::Move(MoveMode::Topic, k2.clone(), anchor, None));
+                    })));
+                }
+                if can_delete {
+                    let (s4, topic, display) = (session.clone(), name.clone(), display.clone());
+                    menu = menu.child(sep()).child(item("m-delete", "Delete topic…".into(), "trash", true).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.close_menu(cx);
+                            delete_topic(s4.clone(), sid, topic.clone(), &display, window, cx);
+                        },
+                    )));
+                }
             }
             SideMenu::Dm(k) => {
                 let others: Vec<u64> = k.others(me).collect();

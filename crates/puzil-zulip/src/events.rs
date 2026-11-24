@@ -13,7 +13,8 @@ use crate::types::*;
 pub enum Event {
     Message { message: Box<Message>, flags: Vec<String> },
     UpdateMessage(Box<UpdateMessage>),
-    DeleteMessage { message_ids: Vec<MessageId> },
+    /// `stream_id` is set for channel messages (their topic list may have lost a topic).
+    DeleteMessage { message_ids: Vec<MessageId>, stream_id: Option<StreamId> },
     UpdateMessageFlags(UpdateFlags),
     Reaction { add: bool, message_id: MessageId, reaction: Reaction },
     Subscription(SubscriptionEvent),
@@ -24,6 +25,12 @@ pub enum Event {
     RealmEmoji(HashMap<String, RealmEmoji>),
     /// `channel_folder` add, update or reorder, applied from the raw event.
     ChannelFolder(Value),
+    /// `realm` update or update_dict: organization settings, applied from the raw event.
+    Realm(Value),
+    /// `user_group` add, update, remove, and member and subgroup changes, from the raw event.
+    UserGroup(Value),
+    /// `default_streams`: the channels new users join.
+    DefaultStreams(Vec<Value>),
     Typing { start: bool, sender: UserId, stream_id: Option<StreamId>, topic: Option<String>, recipients: Vec<UserId> },
     Heartbeat,
     /// Unmodeled or malformed. `kind` is the event's `type`/`op`.
@@ -87,6 +94,8 @@ pub enum SubscriptionEvent {
     Add(Vec<(Stream, Subscription)>),
     Remove(Vec<StreamId>),
     Update { stream_id: StreamId, property: String, value: Value },
+    /// Other people joined (or left) channels: `peer_add` / `peer_remove`.
+    Peers { add: bool, stream_ids: Vec<StreamId>, user_ids: Vec<UserId> },
     Other(String),
 }
 
@@ -94,7 +103,9 @@ pub enum SubscriptionEvent {
 pub enum StreamEvent {
     Create(Vec<Stream>),
     Delete(Vec<StreamId>),
-    Update { stream_id: StreamId, property: String, value: Value },
+    /// `raw` is the whole event: some updates carry related fields alongside (a privacy change
+    /// sends the history and web-public flags, a description its rendered form).
+    Update { stream_id: StreamId, property: String, value: Value, raw: Value },
     Other(String),
 }
 
@@ -153,7 +164,7 @@ fn try_parse(ty: &str, op: &str, v: &Value) -> Result<Event, ParseErr> {
         "delete_message" => {
             // Bulk form (with the `bulk_message_deletion` capability) has `message_ids`.
             let ids = if v.get("message_ids").is_some() { field(v, "message_ids")? } else { vec![field(v, "message_id")?] };
-            Event::DeleteMessage { message_ids: ids }
+            Event::DeleteMessage { message_ids: ids, stream_id: v["stream_id"].as_u64() }
         }
         "update_message_flags" => {
             // Older servers use `operation` instead of `op`.
@@ -186,6 +197,11 @@ fn try_parse(ty: &str, op: &str, v: &Value) -> Result<Event, ParseErr> {
                 property: field(v, "property")?,
                 value: v["value"].clone(),
             },
+            "peer_add" | "peer_remove" => SubscriptionEvent::Peers {
+                add: op == "peer_add",
+                stream_ids: field(v, "stream_ids")?,
+                user_ids: field(v, "user_ids")?,
+            },
             o => SubscriptionEvent::Other(o.into()),
         }),
         "stream" => Event::Stream(match op {
@@ -202,6 +218,7 @@ fn try_parse(ty: &str, op: &str, v: &Value) -> Result<Event, ParseErr> {
                 stream_id: field(v, "stream_id")?,
                 property: field(v, "property")?,
                 value: v["value"].clone(),
+                raw: v.clone(),
             },
             o => StreamEvent::Other(o.into()),
         }),
@@ -214,6 +231,9 @@ fn try_parse(ty: &str, op: &str, v: &Value) -> Result<Event, ParseErr> {
         "user_topic" => Event::UserTopic(UserTopic::deserialize(v)?),
         "muted_users" => Event::MutedUsers(field(v, "muted_users")?),
         "realm_emoji" if op == "update" => Event::RealmEmoji(field(v, "realm_emoji")?),
+        "realm" if op == "update" || op == "update_dict" => Event::Realm(v.clone()),
+        "user_group" => Event::UserGroup(v.clone()),
+        "default_streams" => Event::DefaultStreams(field(v, "default_streams")?),
         "typing" => Event::Typing {
             start: op == "start",
             sender: field::<Value>(v, "sender")?["user_id"].as_u64().ok_or(ParseErr::Bad("sender".into()))?,

@@ -35,15 +35,20 @@ pub struct Workspace {
     conversation_sub: Option<Subscription>,
     /// The channel browser, when it's showing in place of the conversation.
     browser: Option<Entity<ChannelBrowser>>,
+    browser_sub: Option<Subscription>,
     /// Search, when it's showing in place of the conversation.
     search: Option<(Entity<super::search::SearchView>, Subscription)>,
     /// Settings, when showing in place of the conversation.
     settings: Option<(Entity<super::settings_view::SettingsView>, ())>,
+    /// A channel's settings, when showing in place of the conversation.
+    channel_settings: Option<Entity<super::channel_settings::ChannelSettings>>,
     /// The first-run welcome, until it's finished.
     welcome: Option<(Entity<super::welcome::Welcome>, Subscription)>,
     active: bool,
     /// The quick switcher, while it's open.
     switcher: Option<(Entity<super::switcher::Switcher>, Subscription)>,
+    /// The Move dialog, while it's open.
+    move_dialog: Option<(Entity<super::move_dialog::MoveDialog>, Subscription)>,
     theme: Rc<Theme>,
     /// The image shown full-size over everything, if any.
     lightbox: Option<Media>,
@@ -65,10 +70,32 @@ impl Workspace {
                 SidebarEvent::Browse => {
                     this.search = None;
                     this.settings = None;
+                    this.channel_settings = None;
                     let (session, theme) = (this.session.clone(), this.theme.clone());
-                    this.browser = Some(cx.new(|cx| ChannelBrowser::new(session, theme, window, cx)));
+                    let b = cx.new(|cx| ChannelBrowser::new(session, theme, window, cx));
+                    this.browser_sub = Some(cx.subscribe_in(&b, window, |this, _, e: &super::browser::BrowserEvent, window, cx| match e {
+                        // The channel's event may land a moment after the reply: wait for it (up to 5 s).
+                        super::browser::BrowserEvent::Created(sid) => {
+                            let sid = *sid;
+                            cx.spawn_in(window, async move |this, cx| {
+                                for _ in 0..50 {
+                                    let known = this.update(cx, |w, cx| w.session.read(cx).state.streams.contains_key(&sid)).unwrap_or(true);
+                                    if known {
+                                        break;
+                                    }
+                                    cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                                }
+                                let _ = this.update_in(cx, |w, window, cx| w.open(Target::NewTopic(sid), window, cx));
+                            })
+                            .detach();
+                        }
+                        super::browser::BrowserEvent::Settings(sid) => this.show_channel_settings(*sid, window, cx),
+                    }));
+                    this.browser = Some(b);
                     cx.notify();
                 }
+                SidebarEvent::Move(mode, key, anchor, to) => this.open_move(*mode, key.clone(), *anchor, *to, window, cx),
+                SidebarEvent::ChannelSettings(sid) => this.show_channel_settings(*sid, window, cx),
             }),
             cx.observe_window_appearance(window, |this, window, cx| this.refresh_theme(window, cx)),
             cx.observe_in(&crate::settings::handle(cx), window, |this, _, window, cx| {
@@ -98,11 +125,14 @@ impl Workspace {
             conversation: None,
             conversation_sub: None,
             browser: None,
+            browser_sub: None,
             search: None,
             settings: None,
+            channel_settings: None,
             welcome,
             active: false,
             switcher: None,
+            move_dialog: None,
             theme,
             lightbox: None,
             lightbox_focus: cx.focus_handle(),
@@ -116,7 +146,7 @@ impl Workspace {
             // Going somewhere from the sidebar counts as finishing the welcome.
             crate::settings::handle(cx).update(cx, |s, cx| s.update(&crate::settings::Scope::App, |l| l.onboarded = Some(true), cx));
         }
-        if self.browser.take().is_some() | self.search.take().is_some() | self.settings.take().is_some() {
+        if self.browser.take().is_some() | self.search.take().is_some() | self.settings.take().is_some() | self.channel_settings.take().is_some() {
             cx.notify();
         }
         if self.conversation.as_ref().is_some_and(|c| c.read(cx).target == t) {
@@ -133,6 +163,8 @@ impl Workspace {
                     c.update(cx, |c, cx| c.composer().update(cx, |comp, cx| comp.prefill(topic, body, window, cx)));
                 }
             }
+            ConversationEvent::Move(mode, key, anchor) => this.open_move(*mode, key.clone(), *anchor, None, window, cx),
+            ConversationEvent::ChannelSettings(sid) => this.show_channel_settings(*sid, window, cx),
             ConversationEvent::OpenImage(m) => {
                 this.lightbox = Some(m.clone());
                 this.lightbox_focus.focus(window, cx);
@@ -187,6 +219,9 @@ impl Workspace {
         if let Some((st, _)) = &self.settings {
             st.update(cx, |st, cx| st.set_theme(theme.clone(), cx));
         }
+        if let Some(cs) = &self.channel_settings {
+            cs.update(cx, |cs, cx| cs.set_theme(theme.clone(), cx));
+        }
         if let Some((w, _)) = &self.welcome {
             w.update(cx, |w, cx| w.set_theme(theme.clone(), cx));
         }
@@ -223,6 +258,7 @@ impl Workspace {
         }
         self.switcher = None;
         self.settings = None;
+        self.channel_settings = None;
         let (session, theme) = (self.session.clone(), self.theme.clone());
         let view = cx.new(|cx| super::search::SearchView::new(session, theme, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, _, e: &super::search::SearchEvent, window, cx| match e {
@@ -238,14 +274,75 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn show_channel_settings(&mut self, sid: puzil_zulip::types::StreamId, window: &mut Window, cx: &mut Context<Self>) {
+        use super::channel_settings::{ChannelSettings, Tab};
+        self.search = None;
+        self.browser = None;
+        self.switcher = None;
+        self.settings = None;
+        let (session, theme) = (self.session.clone(), self.theme.clone());
+        self.channel_settings = Some(cx.new(|cx| ChannelSettings::new(session, theme, sid, Tab::General, window, cx)));
+        cx.notify();
+    }
+
     fn show_settings(&mut self, section: super::settings_view::Section, window: &mut Window, cx: &mut Context<Self>) {
         self.search = None;
         self.browser = None;
         self.switcher = None;
+        self.channel_settings = None;
         let (session, theme) = (self.session.clone(), self.theme.clone());
         let view = cx.new(|cx| super::settings_view::SettingsView::new(session, theme, section, window, cx));
         self.settings = Some((view, ()));
         cx.notify();
+    }
+
+    pub fn open_move(
+        &mut self,
+        mode: super::move_dialog::MoveMode,
+        key: puzil_zulip::model::TopicKey,
+        anchor: u64,
+        to: Option<puzil_zulip::types::StreamId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use super::move_dialog::{MoveDialog, MoveEvent};
+        self.switcher = None;
+        let (session, theme) = (self.session.clone(), self.theme.clone());
+        let d = cx.new(|cx| MoveDialog::new(session, theme, mode, key.clone(), anchor, to, window, cx));
+        let sub = cx.subscribe_in(&d, window, move |this, _, e: &MoveEvent, window, cx| {
+            this.move_dialog = None;
+            match e {
+                // Follow the moved conversation if it's the one showing.
+                MoveEvent::Done(Some(to)) => {
+                    let showing = this.conversation.as_ref().is_some_and(|c| c.read(cx).target == Target::Conv(puzil_zulip::model::Conv::Topic(key.clone())));
+                    if showing {
+                        this.open(to.clone(), window, cx);
+                    }
+                }
+                MoveEvent::Done(None) | MoveEvent::Dismiss => {}
+            }
+            this.refocus(window, cx);
+            cx.notify();
+        });
+        self.move_dialog = Some((d, sub));
+        cx.notify();
+    }
+
+    fn close_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_dialog = None;
+        self.refocus(window, cx);
+        cx.notify();
+    }
+
+    /// Back to the composer after a dialog closes.
+    fn refocus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only when the conversation is what's showing (not Browse, Search or settings over it).
+        let covered = self.browser.is_some() || self.search.is_some() || self.settings.is_some() || self.channel_settings.is_some();
+        if let (Some(c), false) = (&self.conversation, covered) {
+            c.update(cx, |c, cx| c.composer().update(cx, |comp, cx| comp.focus(window, cx)));
+        } else {
+            self.focus.focus(window, cx);
+        }
     }
 
     fn close_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -483,6 +580,19 @@ impl Render for Workspace {
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_switcher(window, cx)))
                 .child(super::motion::pop_in("switcher-in", div().child(sw.clone())))
         });
+        let move_dialog = self.move_dialog.as_ref().map(|(d, _)| {
+            div()
+                .id("move-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(90.))
+                .bg(hsla(0., 0., 0., if self.theme.dark { 0.6 } else { 0.28 }))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_move(window, cx)))
+                .child(super::motion::pop_in("move-in", div().child(d.clone())))
+        });
         let lightbox = self.lightbox.clone().map(|m| self.render_lightbox(&m, window, cx).into_any_element());
         let t = &self.theme;
         div()
@@ -501,7 +611,8 @@ impl Render for Workspace {
             // The sidebar redraws only when something it shows changes (GPUI reuses its last
             // frame otherwise): scrolling a conversation used to lay it out and paint it again
             // every frame, ~10% of the work.
-            .child(match self.sidebar.read(cx).cached_width() {
+            // Not while dragging a topic: its drop targets highlight under the pointer.
+            .child(match self.sidebar.read(cx).cached_width().filter(|_| !cx.has_active_drag()) {
                 Some(w) => AnyView::from(self.sidebar.clone()).cached(StyleRefinement::default().w(px(w)).h_full().flex_none()).into_any_element(),
                 None => self.sidebar.clone().into_any_element(),
             })
@@ -512,6 +623,7 @@ impl Render for Workspace {
                 _ if self.settings.is_some() => {
                     div().flex_1().min_w_0().h_full().children(self.settings.as_ref().map(|(s, _)| s.clone()))
                 }
+                _ if self.channel_settings.is_some() => div().flex_1().min_w_0().h_full().children(self.channel_settings.clone()),
                 _ if self.search.is_some() => {
                     div().flex_1().min_w_0().h_full().children(self.search.as_ref().map(|(s, _)| s.clone()))
                 }
@@ -547,6 +659,7 @@ impl Render for Workspace {
             })
             .children(self.render_update_prompt(cx))
             .children(switcher)
+            .children(move_dialog)
             .children(lightbox)
     }
 }

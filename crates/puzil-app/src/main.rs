@@ -271,6 +271,10 @@ fn main() {
     STARTED.get_or_init(std::time::Instant::now);
     // Before any thread or HTTP client exists: benchmark mode turns the network off.
     bench::prepare();
+    // PUZIL_OFFLINE=1 (UI tests): the cache only; nothing a test does can reach a server.
+    if std::env::var_os("PUZIL_OFFLINE").is_some() {
+        puzil_zulip::client::set_offline();
+    }
     bench::mark("main");
     init_logging();
     bench::mark("logging");
@@ -390,7 +394,10 @@ fn main() {
             }
         })
         .detach();
-        cx.activate(true);
+        // PUZIL_BACKGROUND=1 (UI tests) opens the window without taking focus from the app in use.
+        if std::env::var_os("PUZIL_BACKGROUND").is_none() {
+            cx.activate(true);
+        }
     });
 }
 
