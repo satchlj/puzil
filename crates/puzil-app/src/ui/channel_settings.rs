@@ -73,6 +73,7 @@ pub struct ChannelSettings {
     tab: Tab,
     name: Entity<InputState>,
     description: Entity<TextareaState>,
+    desc_spell: super::spell_field::Spell,
     filter: Entity<InputState>,
     /// Add people, while open.
     adder: Option<(Entity<PeoplePicker>, Subscription)>,
@@ -110,6 +111,7 @@ impl ChannelSettings {
         name.update(cx, |i, cx| i.set_value(name_base.clone(), window, cx));
         let description = cx.new(|cx| TextareaState::new(window, cx).auto_grow(2, 6).submit_on_enter(true).placeholder("What it's for"));
         description.update(cx, |i, cx| i.set_value(desc_base.clone(), window, cx));
+        let desc_spell = super::spell_field::Spell::new(&description, |c: &mut Self| &mut c.desc_spell, &theme, window, cx);
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter subscribers"));
         let subs = vec![
             cx.subscribe_in(&name, window, |this, _, e: &InputEvent, _, cx| {
@@ -142,6 +144,7 @@ impl ChannelSettings {
                     && !this.description.read(cx).focus_handle(cx).is_focused(window)
                 {
                     this.description.update(cx, |i, cx| i.set_value(desc.clone(), window, cx));
+                    this.desc_spell.reset(cx);
                     this.desc_base = desc;
                 }
                 // A removal is done once the member list no longer has them.
@@ -163,6 +166,7 @@ impl ChannelSettings {
             tab: Tab::General,
             name,
             description,
+            desc_spell,
             filter,
             adder: None,
             custom: None,
@@ -427,7 +431,7 @@ fn friendly(e: puzil_zulip::ApiError) -> String {
 // ---- Rendering ----
 
 impl ChannelSettings {
-    fn general(&self, st: &Stream, admin: bool, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn general(&self, st: &Stream, admin: bool, desc_field: AnyElement, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = self.theme.clone();
         let s = self.session.read(cx);
         let mut out = Vec::new();
@@ -454,7 +458,7 @@ impl ChannelSettings {
                     .border_1()
                     .border_color(if desc_focused { t.accent } else { t.divider })
                     .bg(t.panel)
-                    .child(Textarea::new(&self.description).appearance(false))
+                    .child(desc_field)
                     .into_any_element()
             } else {
                 div()
@@ -986,7 +990,11 @@ impl Render for ChannelSettings {
                 .on_click(cx.listener(move |this, _, _, cx| this.show(tab, cx)))
         }));
         let body: Vec<AnyElement> = match self.tab {
-            Tab::General => self.general(&st, admin, window, cx),
+            Tab::General => {
+                let t = self.theme.clone();
+                let field = self.desc_spell.wrap(Textarea::new(&self.description).appearance(false), |c: &mut Self| &mut c.desc_spell, &t, window, cx).into_any_element();
+                self.general(&st, admin, field, window, cx)
+            }
             Tab::Permissions => self.permissions(&st, admin, cx),
             Tab::Subscribers => self.subscribers(&st, cx),
             Tab::Personal => self.personal(cx),

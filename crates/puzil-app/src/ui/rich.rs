@@ -610,9 +610,14 @@ fn hit(layout: &TextLayout, p: Point<Pixels>) -> usize {
 }
 
 fn link_at(para: &Paragraph, layout: &TextLayout, p: Point<Pixels>) -> Option<Arc<str>> {
+    link_ix(para, layout, p).map(|i| para.links[i].1.clone())
+}
+
+/// Which of the paragraph's links is under `p`.
+fn link_ix(para: &Paragraph, layout: &TextLayout, p: Point<Pixels>) -> Option<usize> {
     // Only an exact hit counts: `Err` means the point is past the end of a line.
     let i = layout.index_for_position(p).ok()?;
-    para.links.iter().find(|(r, _)| r.contains(&i)).map(|(_, l)| l.clone())
+    para.links.iter().position(|(r, _)| r.contains(&i))
 }
 
 impl Element for RichText {
@@ -715,20 +720,34 @@ impl Element for RichText {
             }
         }
 
-        let over_link = hitbox.is_hovered(window) && link_at(&para, &layout, window.mouse_position()).is_some();
+        let hovered = if hitbox.is_hovered(window) { link_ix(&para, &layout, window.mouse_position()) } else { None };
+        let over_link = hovered.is_some();
         if hitbox.is_hovered(window) {
             window.set_cursor_style(if over_link { CursorStyle::PointingHand } else { CursorStyle::IBeam }, hitbox);
         }
-        // The cursor is chosen at paint, and moving within the paragraph doesn't repaint:
-        // ask for a frame when the pointer crosses onto or off a link (or a mention).
+        // The link under the pointer is underlined (not mentions: they're pills). Under its
+        // glyphs on each line it covers, in the link colour.
+        if let Some((r, target)) = hovered.and_then(|i| para.links.get(i))
+            && !target.starts_with(USER_LINK)
+        {
+            for b in range_rects(&layout, &para.text, bounds, r.clone()) {
+                let Some(line) = layout.line_layout_for_index(hit(&layout, b.center())) else { continue };
+                let l = &line.unwrapped_layout;
+                let baseline = b.top() + (lh - l.ascent - l.descent) / 2. + l.ascent;
+                let y = baseline + (l.descent * 0.45).max(px(1.));
+                window.paint_quad(fill(Bounds::new(point(b.left(), y), size(b.size.width, px(1.))), self.theme.link));
+            }
+        }
+        // The cursor and underline are chosen at paint, and moving within the paragraph doesn't
+        // repaint: ask for a frame when the pointer crosses onto, off or between links.
         if !para.links.is_empty() {
             let (layout, para, hitbox) = (layout.clone(), para.clone(), hitbox.clone());
             window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, _| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
-                let now = hitbox.is_hovered(window) && link_at(&para, &layout, e.position).is_some();
-                if now != over_link {
+                let now = if hitbox.is_hovered(window) { link_ix(&para, &layout, e.position) } else { None };
+                if now != hovered {
                     window.refresh();
                 }
             });

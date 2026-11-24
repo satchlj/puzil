@@ -67,6 +67,7 @@ impl Workspace {
             cx.subscribe_in(&sidebar, window, |this, _, e: &SidebarEvent, window, cx| match e {
                 SidebarEvent::Open(t) => this.open(t.clone(), window, cx),
                 SidebarEvent::Settings => this.show_settings(super::settings_view::Section::Appearance, window, cx),
+                SidebarEvent::QuickSwitch => this.open_switcher(vec![], window, cx),
                 SidebarEvent::Browse => {
                     this.search = None;
                     this.settings = None;
@@ -165,6 +166,7 @@ impl Workspace {
             }
             ConversationEvent::Move(mode, key, anchor) => this.open_move(*mode, key.clone(), *anchor, None, window, cx),
             ConversationEvent::ChannelSettings(sid) => this.show_channel_settings(*sid, window, cx),
+            ConversationEvent::AddPeople(people) => this.open_switcher(people.clone(), window, cx),
             ConversationEvent::OpenImage(m) => {
                 this.lightbox = Some(m.clone());
                 this.lightbox_focus.focus(window, cx);
@@ -235,8 +237,13 @@ impl Workspace {
         if self.switcher.is_some() {
             return self.close_switcher(window, cx);
         }
+        self.open_switcher(vec![], window, cx);
+    }
+
+    /// The quick switcher, with `people` already picked (Add people in a DM).
+    fn open_switcher(&mut self, people: Vec<u64>, window: &mut Window, cx: &mut Context<Self>) {
         let (session, theme) = (self.session.clone(), self.theme.clone());
-        let sw = cx.new(|cx| super::switcher::Switcher::new(session, theme, window, cx));
+        let sw = cx.new(|cx| super::switcher::Switcher::new(session, theme, people, window, cx));
         let sub = cx.subscribe_in(&sw, window, |this, _, e: &super::switcher::SwitcherEvent, window, cx| match e {
             super::switcher::SwitcherEvent::Open(t) => {
                 let t = t.clone();
@@ -605,6 +612,8 @@ impl Render for Workspace {
             .font_family(super::rich::UI_FONT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::quick_switch))
+            .on_action(|_: &super::edge_keys::EdgeUp, window, cx| super::edge_keys::handle(false, window, cx))
+            .on_action(|_: &super::edge_keys::EdgeDown, window, cx| super::edge_keys::handle(true, window, cx))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.show_settings(super::settings_view::Section::Appearance, window, cx)))
             .on_action(cx.listener(|this, _: &ShowAbout, window, cx| this.show_settings(super::settings_view::Section::Advanced, window, cx)))
