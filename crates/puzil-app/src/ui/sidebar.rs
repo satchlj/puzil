@@ -24,6 +24,8 @@ use crate::{
 
 pub enum SidebarEvent {
     Open(Target),
+    /// Open the quick switcher (the "Find or start a conversation" button).
+    QuickSwitch,
     /// Show every channel, to join or leave some.
     Browse,
     /// Open Settings.
@@ -860,7 +862,7 @@ impl Render for Sidebar {
                     let others: Vec<u64> = k.others(s.state.me).collect();
                     let other = others.first().copied().unwrap_or(s.state.me);
                     DmRow {
-                        name: s.state.dm_display(&k),
+                        name: s.state.dm_short(&k),
                         group: others.len() > 1,
                         avatar: s.state.users.get(&other).and_then(|u| u.avatar_url.clone()),
                         other,
@@ -891,7 +893,32 @@ impl Render for Sidebar {
         let mut rows: Vec<AnyElement> = Vec::new();
         let all_dms = self.all_dms;
         let dm_unread = dm_rows.iter().filter(|r| counts.get(&Conv::Dm(r.key.clone())).is_some_and(|c| c.unread > 0)).count();
-        rows.push(div().h(px(8.)).into_any_element());
+        // Above the DMs: a field-like button that opens ⌘K (its tooltip says so, so you know
+        // you needn't click it).
+        let tip_theme = t.clone();
+        rows.push(
+            div()
+                .id("find-conversation")
+                .mx_3()
+                .mt_2()
+                .mb_1()
+                .h(px(30.))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(6.))
+                .bg(t.input_bg)
+                .cursor_pointer()
+                .hover(|d| d.bg(t.bg_hover))
+                .text_size(px(13.))
+                .text_color(t.faint)
+                .child(icons::icon("search", 14., t.faint))
+                .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child("Find or start a conversation"))
+                .tooltip(move |_, cx| super::kit::tip("Shortcut: ⌘K", tip_theme.clone(), cx))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::QuickSwitch)))
+                .into_any_element(),
+        );
         // Collapsed: the few most recent, unread first (the selected one always stays).
         let mut order: Vec<usize> = (0..dm_rows.len()).collect();
         if !all_dms {

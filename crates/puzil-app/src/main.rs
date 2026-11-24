@@ -21,6 +21,7 @@ mod overlay;
 mod runtime;
 mod servers;
 mod session;
+mod spell;
 mod settings;
 mod theme;
 mod typing;
@@ -354,6 +355,8 @@ fn main() {
             KeyBinding::new("ctrl-c", CopySelection, Some("Conversation")),
         ]);
         math::init(cx);
+        ui::edge_keys::bind_keys(cx);
+        ui::spell_field::bind_keys(cx);
         ui::composer::bind_keys(cx);
         ui::workspace::bind_keys(cx);
         ui::conversation::bind_keys(cx);

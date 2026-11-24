@@ -693,6 +693,24 @@ impl State {
         names.join(", ")
     }
 
+    /// A group DM by first names ("Ann, Bo, Cy"), for the sidebar; a full name where two
+    /// people in it share a first name. A 1:1 DM keeps the full name.
+    pub fn dm_short(&self, k: &DmKey) -> String {
+        let names: Vec<String> = k.others(self.me).map(|u| self.user_name(u)).collect();
+        if names.len() < 2 {
+            return names.join(", ");
+        }
+        let first = |n: &str| n.split_whitespace().next().unwrap_or(n).to_string();
+        names
+            .iter()
+            .map(|n| {
+                let f = first(n);
+                if names.iter().filter(|m| first(m) == f).count() > 1 { n.clone() } else { f }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Unread counts per conversation, ignoring muting.
     pub fn unread_by_conv(&self) -> BTreeMap<Conv, Vec<MessageId>> {
         let mut m: BTreeMap<Conv, Vec<MessageId>> = BTreeMap::new();

@@ -571,6 +571,24 @@ impl SettingsView {
         let mins = self.stepper("group", eff.group_minutes, 1, 60, "min", cx, |p, v| p.group_minutes = Some(v));
         let info = self.layer_info("group", layer.group_minutes.is_some(), format!("{} min", def.group_minutes), cx, |l| l.group_minutes = None);
         out.push(self.row("Group consecutive messages", Some("Messages from one person within this long share a name and avatar."), mins, info).into_any_element());
+        // Spelling: macOS has its own autocorrect setting; elsewhere Puzil's.
+        out.push(self.heading("Writing").into_any_element());
+        if cfg!(target_os = "macos") {
+            out.push(
+                self.row(
+                    "Spelling",
+                    Some("Misspelled words are underlined; \u{2318}; jumps to one and lists fixes, as does right-clicking it. Autocorrect follows macOS: System Settings \u{203a} Keyboard \u{203a} Text Input \u{203a} Correct spelling automatically. Backspace right after a correction undoes it."),
+                    div(),
+                    None,
+                )
+                .into_any_element(),
+            );
+        } else {
+            let on = eff.autocorrect;
+            let toggle = self.toggle("autocorrect", on).on_click(cx.listener(move |this, _, _, cx| this.change(move |l| l.autocorrect = Some(!on), cx)));
+            let info = self.layer_info("autocorrect", layer.autocorrect.is_some(), if def.autocorrect { "on" } else { "off" }.into(), cx, |l| l.autocorrect = None);
+            out.push(self.row("Correct spelling automatically", Some("Fixes an obvious typo (one letter off) when you finish the word. Backspace right after puts back what you typed. Misspelled words are underlined either way; Ctrl+; jumps to one and lists fixes."), toggle, info).into_any_element());
+        }
         out
     }
 

@@ -4,7 +4,7 @@
 use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::{
-    component::input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    component::input::{InputEvent, Textarea, TextareaState},
     prelude::FluentBuilder as _,
     *,
 };
@@ -70,7 +70,9 @@ pub struct Composer {
     target: Target,
     theme: Rc<Theme>,
     input: Entity<TextareaState>,
-    topic: Option<Entity<InputState>>,
+    topic: Option<Entity<TextareaState>>,
+    spell: super::spell_field::Spell,
+    topic_spell: Option<super::spell_field::Spell>,
     mode: Mode,
     completion: Option<Completion>,
     uploads: usize,
@@ -86,14 +88,22 @@ impl Composer {
     pub fn new(session: Entity<Session>, target: Target, theme: Rc<Theme>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let placeholder = Self::placeholder(&session, &target, cx);
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 12).submit_on_enter(true).placeholder(placeholder));
-        let topic = matches!(target, Target::NewTopic(_)).then(|| cx.new(|cx| InputState::new(window, cx).placeholder("Topic")));
+        // One line, as a textarea so misspellings can be underlined.
+        let topic = matches!(target, Target::NewTopic(_))
+            .then(|| cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).submit_on_enter(true).placeholder("Topic")));
         let subs = vec![cx.subscribe_in(&input, window, Self::on_input)];
+        let spell = super::spell_field::Spell::new(&input, |c: &mut Self| &mut c.spell, &theme, window, cx);
+        let topic_spell = topic.as_ref().map(|t| {
+            super::spell_field::Spell::new(t, |c: &mut Self| c.topic_spell.as_mut().expect("topic field"), &theme, window, cx)
+        });
         let mut this = Self {
             session: session.clone(),
             target,
             theme,
             input,
             topic,
+            spell,
+            topic_spell,
             mode: Mode::New,
             completion: None,
             uploads: 0,
@@ -141,6 +151,7 @@ impl Composer {
             i.set_value(text.clone(), window, cx);
             i.set_selected_range(text.len()..text.len(), cx);
         });
+        self.spell.reset(cx);
         self.quiet = false;
     }
 
@@ -397,7 +408,7 @@ impl Composer {
                 let (conv, topic) = match &self.target {
                     Target::Conv(c) => (c.clone(), self.session.read(cx).send_topic(c)),
                     Target::NewTopic(sid) => {
-                        let topic = self.topic.as_ref().map(|t| t.read(cx).value().trim().to_string()).unwrap_or_default();
+                        let topic = self.topic.as_ref().map(|t| t.read(cx).value().replace('\n', " ").trim().to_string()).unwrap_or_default();
                         (Conv::Topic(TopicKey::new(*sid, &topic)), topic)
                     }
                 };
@@ -561,7 +572,7 @@ fn mime_for(name: &str) -> &'static str {
 }
 
 impl Render for Composer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme.clone();
         let editing = matches!(self.mode, Mode::Edit { .. });
         let images = self.session.read(cx).images.clone();
@@ -666,7 +677,11 @@ impl Render for Composer {
             })
             .when_some(self.error.clone(), |d, e| d.child(div().px_1().text_size(px(12.)).text_color(t.danger).child(e)))
             .when_some(self.topic.clone(), |d, topic| {
-                d.child(Input::new(&topic).appearance(false).bg(t.input_bg).rounded(px(8.)).px_2())
+                let field = Textarea::new(&topic).appearance(false).bg(t.input_bg).rounded(px(8.)).px_2();
+                match &mut self.topic_spell {
+                    Some(s) => d.child(s.wrap(field, |c: &mut Self| c.topic_spell.as_mut().expect("topic field"), &t, window, cx)),
+                    None => d.child(field),
+                }
             })
             .child(
                 div()
@@ -696,7 +711,7 @@ impl Render for Composer {
                             .child(icons::icon("plus", 22., t.icon))
                             .on_click(cx.listener(|this, _, window, cx| this.pick_files(window, cx))),
                     )
-                    .child(div().flex_1().min_w_0().child(Textarea::new(&self.input).appearance(false)))
+                    .child(div().flex_1().min_w_0().child(self.spell.wrap(Textarea::new(&self.input).appearance(false), |c: &mut Self| &mut c.spell, &t, window, cx)))
                     .when(self.uploads > 0, |d| {
                         d.child(
                             div().text_size(px(12.)).text_color(t.muted).mt(px(9.)).child(format!("Uploading {}…", self.uploads)),

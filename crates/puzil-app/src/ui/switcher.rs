@@ -1,10 +1,11 @@
 //! The quick switcher (⌘K): one fuzzy list over channels, topics and people. Picking a
 //! channel narrows the list to its topics (`#channel › …`), since a topic is what opens.
+//! Tab on a person adds them as a chip, for a direct message with several people.
 
 use std::{collections::HashMap, rc::Rc};
 
 use gpui_kit::{
-    component::input::{Input, InputEvent, InputState},
+    component::input::{Backspace, Input, InputEvent, InputState},
     prelude::FluentBuilder as _,
     *,
 };
@@ -48,6 +49,8 @@ pub struct Switcher {
     items: Vec<Item>,
     sel: usize,
     scroll: ScrollHandle,
+    /// People picked with Tab, in order: Enter opens a DM with all of them.
+    picked: Vec<u64>,
     _subs: Vec<Subscription>,
 }
 
@@ -96,8 +99,9 @@ fn fuzzy(q: &str, text: &str) -> Option<i64> {
 }
 
 impl Switcher {
-    pub fn new(session: Entity<Session>, theme: Rc<Theme>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Where would you like to go?"));
+    /// `people`: already picked (Add people in a DM starts with the people in it).
+    pub fn new(session: Entity<Session>, theme: Rc<Theme>, people: Vec<u64>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(Self::placeholder(!people.is_empty())));
         let subs = vec![
             cx.subscribe_in(&input, window, |this, _, e: &InputEvent, window, cx| match e {
                 InputEvent::Change => {
@@ -111,9 +115,57 @@ impl Switcher {
             cx.observe(&session, |this, _, cx| this.refresh(cx)),
         ];
         input.update(cx, |i, cx| i.focus(window, cx));
-        let mut this = Self { session, theme, input, items: vec![], sel: 0, scroll: ScrollHandle::new(), _subs: subs };
+        let mut this = Self { session, theme, input, items: vec![], sel: 0, scroll: ScrollHandle::new(), picked: people, _subs: subs };
         this.refresh(cx);
         this
+    }
+
+    fn placeholder(picking: bool) -> &'static str {
+        if picking { "Add someone else, or Enter to open" } else { "Where would you like to go?" }
+    }
+
+    /// Tab: add the highlighted person (or a group's people) to the picked ones.
+    fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items.get(self.sel).cloned() else { return };
+        let me = self.session.read(cx).state.me;
+        match item.kind {
+            Kind::Person { user, .. } => self.pick([user]),
+            Kind::Group { key } => self.pick(key.others(me).collect::<Vec<_>>()),
+            // A channel: Tab drills into its topics, like Enter. A topic: nothing to add.
+            Kind::Channel { .. } => return self.accept(window, cx),
+            Kind::Topic { .. } => return,
+        }
+        self.reset_query(window, cx);
+    }
+
+    fn pick(&mut self, users: impl IntoIterator<Item = u64>) {
+        for u in users {
+            if !self.picked.contains(&u) {
+                self.picked.push(u);
+            }
+        }
+    }
+
+    fn unpick(&mut self, user: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.picked.retain(|u| *u != user);
+        self.reset_query(window, cx);
+    }
+
+    /// An empty field (and its placeholder) for the next person, and the list for it.
+    fn reset_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picking = !self.picked.is_empty();
+        self.input.update(cx, |i, cx| {
+            i.set_value("", window, cx);
+            i.set_placeholder(Self::placeholder(picking), window, cx);
+            i.focus(window, cx);
+        });
+        self.sel = 0;
+        self.refresh(cx);
+    }
+
+    fn open_picked(&mut self, cx: &mut Context<Self>) {
+        let me = self.session.read(cx).state.me;
+        cx.emit(SwitcherEvent::Open(Target::Conv(Conv::Dm(DmKey::new(me, self.picked.clone())))));
     }
 
     /// `#channel › rest`: the channel the query is narrowed to, and the rest of the query.
@@ -128,7 +180,8 @@ impl Switcher {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let query = self.input.read(cx).value().to_string();
-        let narrowed = self.narrowed(&query, cx);
+        let picking = !self.picked.is_empty();
+        let narrowed = if picking { None } else { self.narrowed(&query, cx) };
         if let Some((sid, _)) = &narrowed {
             let sid = *sid;
             self.session.update(cx, |s, cx| s.load_topics(sid, cx));
@@ -170,8 +223,9 @@ impl Switcher {
             }
         } else {
             let q = query.trim().trim_start_matches(['#', '@']).to_lowercase();
-            let only_channels = query.starts_with('#');
-            let only_people = query.starts_with('@');
+            let only_channels = query.starts_with('#') && !picking;
+            // With people picked, only more people.
+            let only_people = query.starts_with('@') || picking;
             if !only_people {
                 for st in s.state.streams.values().filter(|st| !st.is_archived) {
                     if let Some(score) = fuzzy(&q, &st.name) {
@@ -204,7 +258,7 @@ impl Switcher {
                 }
             }
             if !only_channels {
-                for u in s.state.users.values().filter(|u| !u.deactivated && u.user_id != s.state.me) {
+                for u in s.state.users.values().filter(|u| !u.deactivated && u.user_id != s.state.me && !self.picked.contains(&u.user_id)) {
                     if let Some(score) = fuzzy(&q, &u.full_name) {
                         let key = DmKey::new(s.state.me, [u.user_id]);
                         let n = unread.get(&Conv::Dm(key.clone())).copied().unwrap_or(0);
@@ -218,7 +272,7 @@ impl Switcher {
                         });
                     }
                 }
-                for k in s.state.recent_dms.keys().filter(|k| k.others(s.state.me).count() > 1) {
+                for k in s.state.recent_dms.keys().filter(|k| !picking && k.others(s.state.me).count() > 1) {
                     let name = s.state.dm_display(k);
                     if let Some(score) = fuzzy(&q, &name) {
                         let n = unread.get(&Conv::Dm(k.clone())).copied().unwrap_or(0);
@@ -239,6 +293,15 @@ impl Switcher {
     }
 
     fn accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.picked.is_empty() {
+            // Enter adds whoever is highlighted (if anything is typed) and opens.
+            if !self.input.read(cx).value().trim().is_empty()
+                && let Some(Kind::Person { user, .. }) = self.items.get(self.sel).map(|i| i.kind.clone())
+            {
+                self.pick([user]);
+            }
+            return self.open_picked(cx);
+        }
         let Some(item) = self.items.get(self.sel).cloned() else { return };
         let me = self.session.read(cx).state.me;
         match item.kind {
@@ -318,14 +381,62 @@ impl Render for Switcher {
                                 .child(item.unread.to_string()),
                         )
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                         this.sel = i;
-                        this.accept(window, cx);
+                        if e.modifiers().shift { this.add(window, cx) } else { this.accept(window, cx) }
                     }))
                     .into_any_element()
             })
             .collect();
         let empty = rows.is_empty();
+        let picking = !self.picked.is_empty();
+        // The picked people, as chips before the field; × takes one out.
+        let chips: Vec<AnyElement> = {
+            let s = self.session.read(cx);
+            self.picked
+                .iter()
+                .map(|u| {
+                    let user = s.state.users.get(u);
+                    let name = user.map(|u| u.full_name.clone()).unwrap_or_else(|| "Someone".into());
+                    let avatar = user.and_then(|u| u.avatar_url.clone());
+                    (*u, name, avatar)
+                })
+                .collect::<Vec<_>>()
+        }
+        .into_iter()
+        .map(|(u, name, avatar)| {
+            let img = images.update(cx, |im, cx| im.avatar(u, avatar.as_deref(), cx));
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(26.))
+                .pl(px(3.))
+                .pr(px(4.))
+                .rounded_full()
+                .bg(t.bg_selected)
+                .text_size(px(14.))
+                .text_color(t.fg_strong)
+                .child(super::avatar::avatar(img, 20., t.user_color(u), &name))
+                .child(name)
+                .child(
+                    div()
+                        .id(("unpick", u as usize))
+                        .cursor_pointer()
+                        .rounded_full()
+                        .hover(|d| d.bg(t.bg_hover))
+                        .child(icons::icon("x", 14., t.icon))
+                        .on_click(cx.listener(move |this, _, window, cx| this.unpick(u, window, cx))),
+                )
+                .into_any_element()
+        })
+        .collect();
+        let hint = if picking {
+            "Tab adds a person · Enter opens the conversation · ⌫ removes the last"
+        } else {
+            "↑↓ to move · Enter to open · Tab adds a person to a group · # channels · @ people"
+        };
         div()
             .w(px(560.))
             .max_h(px(440.))
@@ -341,23 +452,30 @@ impl Render for Switcher {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_action(cx.listener(|this, _: &ComposerUp, _, cx| this.step(-1, cx)))
             .on_action(cx.listener(|this, _: &ComposerDown, _, cx| this.step(1, cx)))
-            .on_action(cx.listener(|this, _: &ComposerTab, window, cx| {
-                // Tab drills into a channel, like Enter.
-                if matches!(this.items.get(this.sel).map(|i| &i.kind), Some(Kind::Channel { .. })) {
-                    this.accept(window, cx);
+            .on_action(cx.listener(|this, _: &ComposerTab, window, cx| this.add(window, cx)))
+            .on_action(cx.listener(|_, _: &ComposerEscape, _, cx| cx.emit(SwitcherEvent::Dismiss)))
+            // Backspace in an empty field takes out the last person picked.
+            .capture_action(cx.listener(|this, _: &Backspace, window, cx| {
+                if !this.picked.is_empty() && this.input.read(cx).value().is_empty() {
+                    cx.stop_propagation();
+                    this.picked.pop();
+                    this.reset_query(window, cx);
                 }
             }))
-            .on_action(cx.listener(|_, _: &ComposerEscape, _, cx| cx.emit(SwitcherEvent::Dismiss)))
             .child(
                 div()
-                    .h(px(44.))
+                    .min_h(px(44.))
                     .px_2()
+                    .py(px(7.))
                     .rounded(px(6.))
                     .bg(t.rail)
                     .flex()
+                    .flex_wrap()
                     .items_center()
+                    .gap_1p5()
                     .text_size(px(17.))
-                    .child(Input::new(&self.input).appearance(false)),
+                    .children(chips)
+                    .child(div().flex_1().min_w(px(160.)).child(Input::new(&self.input).appearance(false))),
             )
             .child(
                 div()
@@ -373,7 +491,7 @@ impl Render for Switcher {
                 div()
                     .text_size(px(12.))
                     .text_color(t.faint)
-                    .child("↑↓ to move · Enter to open · # channels · @ people · pick a channel to see its topics"),
+                    .child(hint),
             )
     }
 }

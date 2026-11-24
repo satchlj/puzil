@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use gpui_kit::{
-    component::input::{InputEvent, InputState},
+    component::input::{InputEvent, InputState, Textarea, TextareaState},
     prelude::FluentBuilder as _,
     *,
 };
@@ -70,7 +70,8 @@ pub struct MoveDialog {
     anchor: MessageId,
     scope: Scope,
     channel: StreamId,
-    topic: Entity<InputState>,
+    topic: Entity<TextareaState>,
+    topic_spell: super::spell_field::Spell,
     /// The highlighted topic suggestion, once the arrow keys were used.
     sel: Option<usize>,
     /// The channel list, while open: its filter field.
@@ -108,7 +109,8 @@ impl MoveDialog {
             };
             (st.topic_name(&from), st.topic_display(&from), to.is_some_and(can_drop))
         };
-        let topic = cx.new(|cx| InputState::new(window, cx).placeholder("Topic"));
+        // One line, as a textarea so misspellings can be underlined.
+        let topic = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).submit_on_enter(true).placeholder("Topic"));
         topic.update(cx, |i, cx| {
             i.set_value(from_label.clone(), window, cx);
             i.focus(window, cx);
@@ -132,6 +134,7 @@ impl MoveDialog {
         let channel = to.filter(|_| can_drop).unwrap_or(from.stream_id);
         session.update(cx, |s, cx| s.load_topics(channel, cx));
         let scope = if matches!(mode, MoveMode::Messages(_)) { Scope::One } else { Scope::All };
+        let topic_spell = super::spell_field::Spell::new(&topic, |d: &mut Self| &mut d.topic_spell, &theme, window, cx);
         Self {
             session,
             theme,
@@ -143,6 +146,7 @@ impl MoveDialog {
             scope,
             channel,
             topic,
+            topic_spell,
             sel: None,
             channels: None,
             notify_old: false,
@@ -156,7 +160,7 @@ impl MoveDialog {
     }
 
     fn typed(&self, cx: &App) -> String {
-        self.topic.read(cx).value().trim().to_string()
+        self.topic.read(cx).value().replace('\n', " ").trim().to_string()
     }
 
     /// Existing topics in the destination channel that match what's typed (not the source
@@ -338,6 +342,11 @@ impl Render for MoveDialog {
         let channel_name = s.state.streams.get(&self.channel).map(|st| st.name.clone()).unwrap_or_default();
         let private = s.state.streams.get(&self.channel).is_some_and(|st| st.invite_only);
         let topic_focused = self.topic.read(cx).focus_handle(cx).is_focused(window);
+        let topic_field = {
+            let t = self.theme.clone();
+            let field = Textarea::new(&self.topic).appearance(false);
+            kit::field_box(&t, topic_focused, self.topic_spell.wrap(field, |d: &mut Self| &mut d.topic_spell, &t, window, cx))
+        };
         let typed = self.typed(cx);
         let suggestions = if topic_focused { self.suggestions(cx) } else { Vec::new() };
         // Whether what's typed names an existing topic there (the whole list, not just the six shown).
@@ -405,7 +414,7 @@ impl Render for MoveDialog {
             body = body.child(channel);
         }
 
-        let mut topic = div().child(kit::label(&t, "Topic")).child(kit::field(&t, &self.topic, topic_focused));
+        let mut topic = div().child(kit::label(&t, "Topic")).child(topic_field);
         if !suggestions.is_empty() || (topic_focused && !typed.is_empty() && !exact && self.mode != MoveMode::Rename) {
             let mut list = kit::menu(&t, "topic-suggestions", 400.).mt_1();
             for (i, name) in suggestions.iter().enumerate() {

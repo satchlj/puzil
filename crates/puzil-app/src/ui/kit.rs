@@ -7,6 +7,8 @@ use gpui_kit::{
     *,
 };
 
+use std::rc::Rc;
+
 use crate::{icons, theme::Theme};
 
 /// A filled button (add `on_click`). Disabled ones are dimmed and ignore the pointer.
@@ -82,6 +84,11 @@ pub fn hint(t: &Theme, text: impl Into<SharedString>) -> Div {
 
 /// A text input in a bordered box.
 pub fn field(t: &Theme, input: &Entity<InputState>, focused: bool) -> Div {
+    field_box(t, focused, Input::new(input).appearance(false))
+}
+
+/// The box of [`field`] around any one-line field (a spellchecked one).
+pub fn field_box(t: &Theme, focused: bool, field: impl IntoElement) -> Div {
     div()
         .h(px(36.))
         .px_2p5()
@@ -91,7 +98,7 @@ pub fn field(t: &Theme, input: &Entity<InputState>, focused: bool) -> Div {
         .border_1()
         .border_color(if focused { t.accent } else { t.divider })
         .bg(t.panel)
-        .child(Input::new(input).appearance(false))
+        .child(div().flex_1().min_w_0().child(field))
 }
 
 /// A box that looks like a field but opens a menu: the current choice and a chevron.
@@ -278,4 +285,34 @@ pub fn note(t: &Theme, warn: bool, text: impl IntoElement) -> Div {
         .when(warn, |d| d.bg(t.mention_me_bg).text_color(t.fg_strong))
         .when(!warn, |d| d.bg(t.bg_hover).text_color(t.muted))
         .child(text)
+}
+
+/// A small label shown while the pointer rests on something, for `.tooltip(…)`: who
+/// reacted, or a button's name and shortcut.
+pub fn tip(text: impl Into<SharedString>, theme: Rc<Theme>, cx: &mut App) -> AnyView {
+    let text = text.into();
+    cx.new(|_| Tip { text, theme }).into()
+}
+
+struct Tip {
+    text: SharedString,
+    theme: Rc<Theme>,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let t = &self.theme;
+        div()
+            .max_w(px(320.))
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow_md()
+            .text_size(px(13.))
+            .text_color(t.fg_strong)
+            .child(self.text.clone())
+    }
 }

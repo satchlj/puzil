@@ -4,7 +4,7 @@
 use std::{collections::HashMap, rc::Rc};
 
 use gpui_kit::{
-    component::input::{Input, InputEvent, InputState},
+    component::input::{Input, InputEvent, InputState, Textarea, TextareaState},
     prelude::FluentBuilder as _,
     *,
 };
@@ -30,7 +30,8 @@ pub enum BrowserEvent {
 /// The New channel form.
 struct Form {
     name: Entity<InputState>,
-    description: Entity<InputState>,
+    description: Entity<TextareaState>,
+    desc_spell: super::spell_field::Spell,
     privacy: Privacy,
     folder: Option<i64>,
     folder_menu: Option<Point<Pixels>>,
@@ -75,7 +76,9 @@ impl ChannelBrowser {
     fn new_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = self.session.read(cx).state.me;
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Channel name"));
-        let description = cx.new(|cx| InputState::new(window, cx).placeholder("Optional"));
+        // One line, as a textarea so misspellings can be underlined.
+        let description = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 1).submit_on_enter(true).placeholder("Optional"));
+        let desc_spell = super::spell_field::Spell::new(&description, |b: &mut Self| &mut b.form.as_mut().expect("form").desc_spell, &self.theme, window, cx);
         let picker = cx.new(|cx| PeoplePicker::new(self.session.clone(), self.theme.clone(), false, "Add people…", window, cx));
         picker.update(cx, |p, _| {
             p.exclude.insert(Picked::User(me));
@@ -101,7 +104,7 @@ impl ChannelBrowser {
         ];
         let privacy = if self.session.read(cx).state.can_create_channel(Privacy::Public) { Privacy::Public } else { Privacy::PrivateShared };
         name.update(cx, |n, cx| n.focus(window, cx));
-        self.form = Some(Form { name, description, privacy, folder: None, folder_menu: None, folder_closed: None, people: vec![me], picker, busy: false, error: None, _subs: subs });
+        self.form = Some(Form { name, description, desc_spell, privacy, folder: None, folder_menu: None, folder_closed: None, people: vec![me], picker, busy: false, error: None, _subs: subs });
         cx.notify();
     }
 
@@ -114,7 +117,7 @@ impl ChannelBrowser {
         let (invite_only, is_web_public, history_public_to_subscribers) = f.privacy.flags();
         let req = NewChannel {
             name,
-            description: f.description.read(cx).value().trim().to_string(),
+            description: f.description.read(cx).value().replace('\n', " ").trim().to_string(),
             subscribers: f.people.clone(),
             invite_only,
             is_web_public,
@@ -149,8 +152,9 @@ impl ChannelBrowser {
         .detach();
     }
 
-    fn render_form(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_form(&self, desc_field: Option<AnyElement>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let f = self.form.as_ref()?;
+        let desc_field = desc_field?;
         let t = self.theme.clone();
         let s = self.session.read(cx);
         let options: Vec<(Privacy, &str)> = [(Privacy::Public, "Public"), (Privacy::PrivateShared, "Private, shared history"), (Privacy::PrivateProtected, "Private, protected")]
@@ -247,7 +251,7 @@ impl ChannelBrowser {
                 .py_2()
                 .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).text_color(t.fg_strong).child("New channel"))
                 .child(div().child(kit::label(&t, "Name")).child(kit::field(&t, &f.name, name_focused)))
-                .child(div().child(kit::label(&t, "Description")).child(kit::field(&t, &f.description, desc_focused)))
+                .child(div().child(kit::label(&t, "Description")).child(kit::field_box(&t, desc_focused, desc_field)))
                 .child(div().child(kit::label(&t, "Who can see it")).child(seg))
                 .when(!folders.is_empty(), |d| {
                     d.child(div().child(kit::label(&t, "Folder")).child(div().w(px(240.)).child(kit::picker(&t, "new-folder", folder, true).on_mouse_down(
@@ -309,7 +313,14 @@ impl ChannelBrowser {
 impl Render for ChannelBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme.clone();
-        let form = self.render_form(window, cx);
+        let desc_field = {
+            let t = self.theme.clone();
+            self.form.as_mut().map(|f| {
+                let field = Textarea::new(&f.description).appearance(false);
+                f.desc_spell.wrap(field, |b: &mut Self| &mut b.form.as_mut().expect("form").desc_spell, &t, window, cx).into_any_element()
+            })
+        };
+        let form = self.render_form(desc_field, window, cx);
         let q = self.filter.read(cx).value().to_lowercase();
         let show_archived = self.show_archived;
         let can_create = self.session.read(cx).state.can_create_any_channel();

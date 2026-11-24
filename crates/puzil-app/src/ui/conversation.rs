@@ -70,6 +70,8 @@ pub enum ConversationEvent {
     Move(super::move_dialog::MoveMode, TopicKey, MessageId),
     /// Show a channel's settings.
     ChannelSettings(puzil_zulip::types::StreamId),
+    /// Open the quick switcher with these people picked, to add more (a DM's Add people).
+    AddPeople(Vec<puzil_zulip::types::UserId>),
 }
 
 mod menu;
@@ -762,6 +764,11 @@ impl Conversation {
             _ => None,
         };
         let is_topic = matches!(self.target, Target::Conv(Conv::Topic(_)));
+        // A DM's people, for Add people (opens ⌘K with them picked).
+        let dm_people: Option<Vec<puzil_zulip::types::UserId>> = match &self.target {
+            Target::Conv(Conv::Dm(k)) => Some(k.others(s.state.me).collect()),
+            _ => None,
+        };
         let lead: AnyElement = match &title {
             Title::Topic { channel, private, topic, description } => div()
                 .flex()
@@ -866,6 +873,24 @@ impl Conversation {
             .when_some(error, |d, e| d.child(div().flex_none().text_color(t.danger).text_size(px(13.)).child(e)))
             .child(crate::theme::drag_region(div().id("header-drag").flex_1().h_full()))
             .children(votes)
+            .when_some(dm_people, |d, people| {
+                let tip_theme = t.clone();
+                d.child(
+                    div()
+                        .id("add-people-button")
+                        .flex_none()
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.bg_hover))
+                        .child(icons::icon("user-plus", 18., t.icon))
+                        .tooltip(move |_, cx| super::kit::tip("Add people", tip_theme.clone(), cx))
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(ConversationEvent::AddPeople(people.clone())))),
+                )
+            })
             .when(is_topic, |d| {
                 d.child(
                     div()
@@ -1076,7 +1101,7 @@ impl Conversation {
         let mine = m.sender_id == me;
         let edited = m.last_edit_timestamp.is_some();
         let ts = m.timestamp;
-        let reactions = reaction_chips(m, me);
+        let reactions = reaction_chips(m, me, &s.state.users);
         let hovered = self.hovered == Some(id) || self.bar_hovered == Some(id);
         let kb_selected = self.kb_selected == Some(id) && self.list_focused;
 
@@ -1296,6 +1321,7 @@ impl Conversation {
                                     reactions.into_iter().enumerate().map(|(i, r)| {
                                         let (name, code, kind, mine) = (r.name.clone(), r.code.clone(), r.kind.clone(), r.mine);
                                         let popped = self.reacted.get(&(id, r.code.clone())).is_some_and(|t| t.elapsed().as_millis() < 1500);
+                                        let (tip, tip_theme) = (SharedString::from(r.who.clone()), t.clone());
                                         let chip = div()
                                             .id(ElementId::named_usize(format!("react-{id}"), i))
                                             .flex()
@@ -1322,6 +1348,7 @@ impl Conversation {
                                                         .child(r.count.to_string()),
                                                 )
                                             })
+                                            .tooltip(move |_, cx| super::kit::tip(tip.clone(), tip_theme.clone(), cx))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.toggle_reaction(id, name.clone(), code.clone(), kind.clone(), mine, cx)
                                             }));
@@ -1374,6 +1401,8 @@ impl Conversation {
 
 struct Chip {
     label: String,
+    /// "You, Ann and Bo reacted with :tada:".
+    who: String,
     name: String,
     code: String,
     kind: String,
@@ -1381,30 +1410,63 @@ struct Chip {
     mine: bool,
 }
 
-fn reaction_chips(m: &Message, me: u64) -> Vec<Chip> {
+fn reaction_chips(m: &Message, me: u64, users: &HashMap<u64, puzil_zulip::types::User>) -> Vec<Chip> {
     let mut out: Vec<Chip> = Vec::new();
+    // Who reacted, per chip.
+    let mut people: Vec<Vec<u64>> = Vec::new();
     for r in &m.reactions {
-        match out.iter_mut().find(|c| c.code == r.emoji_code && c.kind == r.reaction_type) {
-            Some(c) => {
-                c.count += 1;
-                c.mine |= r.user_id == me;
+        match out.iter().position(|c| c.code == r.emoji_code && c.kind == r.reaction_type) {
+            Some(i) => {
+                out[i].count += 1;
+                out[i].mine |= r.user_id == me;
+                people[i].push(r.user_id);
             }
-            None => out.push(Chip {
-                label: match r.reaction_type.as_str() {
-                    "unicode_emoji" => {
-                        puzil_render::ast::emoji_glyph(&r.emoji_code).unwrap_or_else(|| format!(":{}:", r.emoji_name))
-                    }
-                    _ => format!(":{}:", r.emoji_name),
-                },
-                name: r.emoji_name.clone(),
-                code: r.emoji_code.clone(),
-                kind: r.reaction_type.clone(),
-                count: 1,
-                mine: r.user_id == me,
-            }),
+            None => {
+                people.push(vec![r.user_id]);
+                out.push(Chip {
+                    who: String::new(),
+                    label: match r.reaction_type.as_str() {
+                        "unicode_emoji" => {
+                            puzil_render::ast::emoji_glyph(&r.emoji_code).unwrap_or_else(|| format!(":{}:", r.emoji_name))
+                        }
+                        _ => format!(":{}:", r.emoji_name),
+                    },
+                    name: r.emoji_name.clone(),
+                    code: r.emoji_code.clone(),
+                    kind: r.reaction_type.clone(),
+                    count: 1,
+                    mine: r.user_id == me,
+                });
+            }
         }
     }
+    for (c, ids) in out.iter_mut().zip(people) {
+        let names = ids
+            .iter()
+            .map(|u| if *u == me { "You".to_string() } else { users.get(u).map_or_else(|| "Someone".to_string(), |u| u.full_name.clone()) })
+            .collect();
+        c.who = format!("{} reacted with :{}:", who_list(names), c.name);
+    }
     out
+}
+
+/// "You", "You and Ann", "You, Ann and Bo"; past 12 names, "… and 9 others".
+fn who_list(mut names: Vec<String>) -> String {
+    const SHOWN: usize = 12;
+    if let Some(i) = names.iter().position(|n| n == "You") {
+        let you = names.remove(i);
+        names.insert(0, you);
+    }
+    let rest = names.len().saturating_sub(SHOWN);
+    if rest > 0 {
+        names.truncate(SHOWN);
+        names.push(format!("{rest} others"));
+    }
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 /// A file name safe to write: no path separators or leading dots.
@@ -1573,6 +1635,16 @@ impl Render for Conversation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lists_who_reacted() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::who_list(v(&["Ann"])), "Ann");
+        assert_eq!(super::who_list(v(&["Ann", "You"])), "You and Ann");
+        assert_eq!(super::who_list(v(&["Ann", "Bo", "You"])), "You, Ann and Bo");
+        let many: Vec<String> = (0..15).map(|i| format!("P{i}")).collect();
+        assert!(super::who_list(many).ends_with("P11 and 3 others"));
+    }
+
     #[test]
     fn decodes_zulip_hash() {
         assert_eq!(super::decode_hash("a.20b.2Ec").as_deref(), Some("a b.c"));

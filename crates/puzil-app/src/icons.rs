@@ -6,7 +6,7 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 
 gpui_kit::assets::icon_assets!(
     Extra,
-    [ArrowBigDown, ArrowBigUp, AtSign, CirclePlus, CornerUpLeft, Hash, MessagesSquare, Pencil, Trash, Users, Bot, Lock, Link, Mail, FaceSlightlySmilingPlus, Compass, CheckCheck, BellOff, Bell, CircleCheck, LogOut, VolumeX, Search, Palette, Monitor, Sun, Moon, Building2, User, Settings2, PanelLeft, Minus, Plus, ArrowDown, ArrowRight, FolderInput, Volume2, X,]
+    [ArrowBigDown, ArrowBigUp, AtSign, CirclePlus, CornerUpLeft, Hash, MessagesSquare, Pencil, Trash, Users, Bot, Lock, Link, Mail, FaceSlightlySmilingPlus, Compass, CheckCheck, BellOff, Bell, CircleCheck, LogOut, VolumeX, Search, Palette, Monitor, Sun, Moon, Building2, User, Settings2, PanelLeft, Minus, Plus, ArrowDown, ArrowRight, FolderInput, Volume2, X, UserPlus,]
 );
 
 pub struct AppAssets;
